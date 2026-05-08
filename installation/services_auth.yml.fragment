@@ -1,0 +1,25 @@
+# ============================================================================
+#  Add this entry to phpBB/config/default/container/services_auth.yml
+#  under the existing  services:  block, matching the indentation of the
+#  other auth.provider.* entries.
+#
+#  IMPORTANT: YAML is whitespace-sensitive.  Use SPACES only (no tabs).
+#  Indentation: 4 spaces for the key, 8 spaces for the children, 12 spaces
+#  for the dashes.  After saving, clear phpBB's cache so the new service
+#  is picked up:
+#
+#    rm -rf phpBB/cache/production/* phpBB/cache/installer/*
+# ============================================================================
+    auth.provider.vb4:
+        class: phpbb\auth\provider\vb4
+        arguments:
+            - '@captcha.factory'
+            - '@config'
+            - '@dbal.conn'
+            - '@passwords.manager'
+            - '@request'
+            - '@user'
+            - '%core.root_path%'
+            - '%core.php_ext%'
+        tags:
+            - { name: auth.provider }

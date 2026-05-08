@@ -1,0 +1,16 @@
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# OS
+Thumbs.db
+desktop.ini
+
+# Local test artifacts
+/tmp/
+test_*.php
+*_fixture.sql
+*.log
