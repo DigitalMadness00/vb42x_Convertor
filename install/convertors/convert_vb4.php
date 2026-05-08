@@ -37,7 +37,7 @@ $convertor_data = array(
 	'forum_name'	=> 'vBulletin 4.x.x',
 	'version'		=> '0.0.12',
 	'phpbb_version'	=> '3.3.16',
-	'author'		=> '<a href="https://www.phpbb.com/community/memberlist.php?mode=viewprofile&u=163542">Dicky</a>, <a href="https://www.phpbb.com/community/memberlist.php?mode=viewprofile&u=304651">prototech</a> &bull; Credits to <a href="http://wlx.westgis.ac.cn/">wlx</a>',
+	'author'		=> 'Modernised for phpBB 3.3 / PHP 8 by <a href="https://github.com/DigitalMadness00/vb42x_Convertor">DigitalMadness00</a> &bull; Original by <a href="https://www.phpbb.com/community/memberlist.php?mode=viewprofile&u=163542">Dicky</a> and <a href="https://www.phpbb.com/community/memberlist.php?mode=viewprofile&u=304651">prototech</a> &bull; Credits to <a href="http://wlx.westgis.ac.cn/">wlx</a>',
 	'dbms'			=> $dbms,
 	'dbhost'		=> $dbhost,
 	'dbport'		=> $dbport,
@@ -46,7 +46,7 @@ $convertor_data = array(
 	'dbname'		=> $dbname,
 	'table_prefix'	=> 'vb_',
 	'forum_path'	=> '../forums',
-	'author_notes'	=> 'Please check forum permissions after conversion.',
+	'author_notes'	=> 'After conversion: clear cookies before logging in (CSRF), then run ACP &rarr; General &rarr; Resync statistics, and ACP &rarr; Maintenance &rarr; Search index &rarr; Create index. See README.md and CHANGES.md in the GitHub repo for the full post-conversion checklist.',
 );
 
 /**
