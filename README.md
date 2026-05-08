@@ -1,5 +1,8 @@
 # vBulletin 4 → phpBB 3.3.x Converter
 
+**Current version:** see the [VERSION](./VERSION) file at the repo root, and
+the latest [Release](../../releases/latest) for downloadable artifacts.
+
 A modernised version of the Dicky / prototech vBulletin 4 converter, brought
 up to **phpBB 3.3.16** running on **PHP 7.x, 8.0, 8.1, 8.2, or 8.3**.
 
@@ -410,11 +413,27 @@ phpBB updates).
 
 ---
 
+## Releases
+
+This repository uses an automated GitHub Actions workflow that bumps the
+patch version (`0.0.X`) on every push to `main`, tags the commit, builds
+a distribution zip, and publishes a GitHub Release.
+
+To download a specific version, visit the [Releases page](../../releases)
+and grab `phpbb-vb4-converter-modernized-X.Y.Z.zip` from the assets.
+
+If you want to track changes between releases, see [CHANGES.md](./CHANGES.md)
+for the full history of fixes vs. the original Dicky/prototech converter.
+
+---
+
 ## Credits
 
 - Original converter: **Dicky** (2008) and **prototech** (2013) on phpbb.com
 - Originally based on phpBB's official phpBB2 converter
-- Updates for phpBB 3.3.x / PHP 7+ compatibility: 2026
+- Modernisation for phpBB 3.3.x / PHP 7+ compatibility (2026): **DigitalMadness00**
+  - GitHub: [@DigitalMadness00](https://github.com/DigitalMadness00) ([repo](https://github.com/DigitalMadness00/vb42x_Convertor))
+  - phpbb.com forums: [DigitalMadness](https://www.phpbb.com/community/memberlist.php?mode=viewprofile&u=2255905)
 
 This converter is GPL-2.0 licensed (inherited from phpBB).
 
@@ -422,7 +441,10 @@ This converter is GPL-2.0 licensed (inherited from phpBB).
 
 ## Contributing
 
-Issues and PRs welcome. When reporting bugs, please include:
+Issues and PRs welcome at the project repo:
+[github.com/DigitalMadness00/vb42x_Convertor](https://github.com/DigitalMadness00/vb42x_Convertor)
+
+When reporting bugs, please include:
 
 - Source vB4 version
 - Destination phpBB version

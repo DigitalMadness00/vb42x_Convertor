@@ -1,0 +1,174 @@
+name: Auto-bump version and release
+
+# Triggers on every push to main, EXCEPT pushes from this workflow itself
+# (we tag those with [skip ci] in the commit message so they don't loop).
+on:
+  push:
+    branches:
+      - main
+
+# We need write access to push the bump commit and tag, and to create
+# the release.  GITHUB_TOKEN is provided automatically by Actions.
+permissions:
+  contents: write
+
+jobs:
+  bump-and-release:
+    runs-on: ubuntu-latest
+
+    # Skip the workflow if the triggering commit was itself an auto-bump.
+    # Without this guard, the bump commit triggers another bump, etc.
+    if: "!contains(github.event.head_commit.message, '[skip ci]')"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # We need full history so we can push back to main.
+          fetch-depth: 0
+          # Use the default GITHUB_TOKEN; the workflow's permissions block
+          # above gives it the contents:write scope it needs.
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Read current version
+        id: current
+        run: |
+          if [ ! -f VERSION ]; then
+            echo "ERROR: VERSION file not found at repo root"
+            exit 1
+          fi
+          CURRENT=$(cat VERSION | tr -d '[:space:]')
+          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
+          echo "Current version: $CURRENT"
+
+      - name: Compute next patch version
+        id: next
+        run: |
+          CURRENT="${{ steps.current.outputs.current }}"
+          # Split MAJOR.MINOR.PATCH and increment patch.
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+          if [ -z "$MAJOR" ] || [ -z "$MINOR" ] || [ -z "$PATCH" ]; then
+            echo "ERROR: VERSION '$CURRENT' is not in MAJOR.MINOR.PATCH form"
+            exit 1
+          fi
+          NEXT="${MAJOR}.${MINOR}.$((PATCH + 1))"
+          echo "next=$NEXT" >> "$GITHUB_OUTPUT"
+          echo "Next version: $NEXT"
+
+      - name: Update VERSION file
+        run: |
+          printf '%s' "${{ steps.next.outputs.next }}" > VERSION
+
+      - name: Update version string in convert_vb4.php
+        run: |
+          NEXT="${{ steps.next.outputs.next }}"
+          # The line we want to replace looks like:
+          #   'version'		=> '0.0.12',
+          # Allow any current version value; replace just what's between the quotes.
+          # Using | as sed delimiter to keep the regex readable.
+          sed -i -E "s|('version'[[:space:]]*=>[[:space:]]*')[^']+(',)|\1${NEXT}\2|" \
+            installation/convertor/convert_vb4.php
+
+          # Sanity-check: file should now reference the new version.
+          if ! grep -q "'version'.*'${NEXT}'" installation/convertor/convert_vb4.php; then
+            echo "ERROR: convert_vb4.php version stamp didn't update"
+            grep "'version'" installation/convertor/convert_vb4.php || true
+            exit 1
+          fi
+
+      - name: Update @version doc-block in auth provider
+        run: |
+          NEXT="${{ steps.next.outputs.next }}"
+          # The line looks like:   * @version 0.0.12
+          sed -i -E "s|(^\*[[:space:]]*@version[[:space:]]+).+|\1${NEXT}|" \
+            installation/auth_provider/vb4.php
+
+          # Sanity check.
+          if ! grep -qE "^\*[[:space:]]*@version[[:space:]]+${NEXT//./\\.}$" \
+            installation/auth_provider/vb4.php; then
+            echo "ERROR: auth provider @version didn't update"
+            grep "@version" installation/auth_provider/vb4.php || true
+            exit 1
+          fi
+
+      - name: PHP syntax check
+        run: |
+          # Ubuntu runners ship with PHP available.
+          for f in \
+            installation/convertor/convert_vb4.php \
+            installation/convertor/functions_vb4.php \
+            installation/auth_provider/vb4.php; do
+            php -l "$f" || exit 1
+          done
+
+      - name: Build distribution zip
+        run: |
+          NEXT="${{ steps.next.outputs.next }}"
+          ZIP="phpbb-vb4-converter-modernized-${NEXT}.zip"
+
+          # Build the zip from the repo tree, excluding git/CI files.
+          # The structure inside the zip mirrors the repo layout so a user
+          # can extract straight into a working directory.
+          zip -r "$ZIP" . \
+            -x '.git/*' \
+            -x '.github/*' \
+            -x '.gitignore' \
+            -x '*.swp' \
+            -x '*.swo' \
+            -x '.DS_Store'
+
+          ls -la "$ZIP"
+          echo "ZIP_NAME=$ZIP" >> "$GITHUB_ENV"
+
+      - name: Commit the version bump
+        run: |
+          NEXT="${{ steps.next.outputs.next }}"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add VERSION \
+            installation/convertor/convert_vb4.php \
+            installation/auth_provider/vb4.php
+
+          # If nothing changed (e.g. somebody manually bumped the same number
+          # in the same push), bail out gracefully rather than failing.
+          if git diff --staged --quiet; then
+            echo "No version changes to commit; skipping."
+            exit 0
+          fi
+
+          # The [skip ci] in the message is what prevents this commit from
+          # re-triggering the workflow.
+          git commit -m "Bump version to ${NEXT} [skip ci]"
+          git push origin HEAD:main
+
+      - name: Create and push tag
+        run: |
+          NEXT="${{ steps.next.outputs.next }}"
+          TAG="v${NEXT}"
+
+          git tag -a "$TAG" -m "Release ${TAG}"
+          git push origin "$TAG"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.next.outputs.next }}
+          name: Release v${{ steps.next.outputs.next }}
+          # The body uses the latest commit subject as the release-note
+          # headline.  For more curated notes, edit the release in the
+          # GitHub UI after the workflow finishes.
+          body: |
+            Automated release of v${{ steps.next.outputs.next }}.
+
+            See [CHANGES.md](./CHANGES.md) for the full history of fixes
+            in this converter compared to the original Dicky/prototech
+            version.
+
+            ## Installation
+
+            Extract the attached zip and follow the instructions in
+            [README.md](./README.md).
+          files: ${{ env.ZIP_NAME }}
+          draft: false
+          prerelease: false
