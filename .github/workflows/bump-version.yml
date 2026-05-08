@@ -21,10 +21,16 @@ jobs:
     if: "!contains(github.event.head_commit.message, '[skip ci]')"
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - name: Checkout repository (latest main)
+        uses: actions/checkout@v5
         with:
-          # We need full history so we can push back to main.
+          # Always check out the tip of main, not the SHA that triggered
+          # the run.  This matters for manual workflow re-runs: if you
+          # re-run an older run, the trigger commit's VERSION may be stale
+          # because the workflow itself has since bumped it.  Pinning to
+          # 'main' keeps re-runs idempotent.
+          ref: main
+          # We need full history so we can push back to main and tag.
           fetch-depth: 0
           # Use the default GITHUB_TOKEN; the workflow's permissions block
           # above gives it the contents:write scope it needs.
@@ -55,11 +61,27 @@ jobs:
           echo "next=$NEXT" >> "$GITHUB_OUTPUT"
           echo "Next version: $NEXT"
 
+      - name: Check whether the next tag already exists
+        id: tagcheck
+        run: |
+          NEXT="${{ steps.next.outputs.next }}"
+          # Make absolutely sure we have all remote tags.
+          git fetch --tags --force
+          if git rev-parse -q --verify "refs/tags/v${NEXT}" >/dev/null; then
+            echo "Tag v${NEXT} already exists - this is a re-run, skipping bump."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Tag v${NEXT} does not yet exist - proceeding with bump."
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Update VERSION file
+        if: steps.tagcheck.outputs.skip == 'false'
         run: |
           printf '%s' "${{ steps.next.outputs.next }}" > VERSION
 
       - name: Update version string in convert_vb4.php
+        if: steps.tagcheck.outputs.skip == 'false'
         run: |
           NEXT="${{ steps.next.outputs.next }}"
           # The line we want to replace looks like:
@@ -77,6 +99,7 @@ jobs:
           fi
 
       - name: Update @version doc-block in auth provider
+        if: steps.tagcheck.outputs.skip == 'false'
         run: |
           NEXT="${{ steps.next.outputs.next }}"
           # The line looks like:   * @version 0.0.12
@@ -92,6 +115,7 @@ jobs:
           fi
 
       - name: PHP syntax check
+        if: steps.tagcheck.outputs.skip == 'false'
         run: |
           # Ubuntu runners ship with PHP available.
           for f in \
@@ -102,6 +126,7 @@ jobs:
           done
 
       - name: Build distribution zip
+        if: steps.tagcheck.outputs.skip == 'false'
         run: |
           NEXT="${{ steps.next.outputs.next }}"
           ZIP="phpbb-vb4-converter-modernized-${NEXT}.zip"
@@ -121,6 +146,7 @@ jobs:
           echo "ZIP_NAME=$ZIP" >> "$GITHUB_ENV"
 
       - name: Commit the version bump
+        if: steps.tagcheck.outputs.skip == 'false'
         run: |
           NEXT="${{ steps.next.outputs.next }}"
           git config user.name  "github-actions[bot]"
@@ -143,14 +169,23 @@ jobs:
           git push origin HEAD:main
 
       - name: Create and push tag
+        if: steps.tagcheck.outputs.skip == 'false'
         run: |
           NEXT="${{ steps.next.outputs.next }}"
           TAG="v${NEXT}"
+
+          # Belt-and-suspenders: even though we already checked, race
+          # conditions across re-runs are possible.  Skip if it now exists.
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            echo "Tag ${TAG} suddenly exists; skipping tag creation."
+            exit 0
+          fi
 
           git tag -a "$TAG" -m "Release ${TAG}"
           git push origin "$TAG"
 
       - name: Create GitHub Release
+        if: steps.tagcheck.outputs.skip == 'false'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ steps.next.outputs.next }}
@@ -172,3 +207,13 @@ jobs:
           files: ${{ env.ZIP_NAME }}
           draft: false
           prerelease: false
+
+      - name: Re-run notice
+        if: steps.tagcheck.outputs.skip == 'true'
+        run: |
+          echo ""
+          echo "==============================================================="
+          echo "  This run was a re-run of an older trigger commit."
+          echo "  Tag v${{ steps.next.outputs.next }} already exists."
+          echo "  No bump performed - this is the correct, idempotent behaviour."
+          echo "==============================================================="
