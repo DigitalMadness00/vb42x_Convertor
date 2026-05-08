@@ -11,7 +11,7 @@
 * @copyright (c) 2013 prototech
 * @copyright (c) 2024 Updated for phpBB 3.3.x
 * @license http://opensource.org/licenses/gpl-license.php GNU Public License
-* @version 0.0.12
+* @version 0.0.13
 *
 * ----------------------------------------------------------------------
 * INSTALLATION
