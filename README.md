@@ -29,17 +29,25 @@ This package fixes all of those. Tested end-to-end on a 962-user / 252,529-post 
 
 ## What's in this repo
 
+The directory structure mirrors phpBB's own — every file's location in
+this repo matches exactly where it goes inside your phpBB installation.
+
 ```
 .
-├── installation/
-│   ├── convertor/
-│   │   ├── convert_vb4.php          # Main converter schema
-│   │   └── functions_vb4.php        # Converter helper functions
-│   ├── auth_provider/
-│   │   └── vb4.php                  # phpBB 3.3 auth provider class
-│   └── services_auth.yml.fragment   # YAML snippet to register the provider
+├── install/
+│   └── convertors/
+│       ├── convert_vb4.php          # Main converter schema
+│       └── functions_vb4.php        # Converter helper functions
+├── phpbb/
+│   └── auth/
+│       └── provider/
+│           └── vb4.php              # Auth provider class for vB4 password format
+├── config/
+│   └── default/
+│       └── container/
+│           └── services_auth.yml.fragment   # Snippet to merge into services_auth.yml
 ├── sql/
-│   └── vb4_pre_conversion_inventory.sql   # Optional: inventory of source content
+│   └── vb4_pre_conversion_inventory.sql     # Optional pre-conversion source inventory
 ├── README.md
 ├── CHANGES.md
 └── LICENSE
@@ -49,26 +57,45 @@ This package fixes all of those. Tested end-to-end on a 962-user / 252,529-post 
 
 ## Installation
 
-### 1. Drop the converter files in
+### 1. Copy the install/, phpbb/, and config/ directories into your phpBB tree
 
-Copy the two converter files into phpBB's installer:
+The simplest way: extract this package's zip and copy three top-level
+directories straight into the root of your phpBB install. The paths
+inside this package mirror phpBB exactly.
+
+If your phpBB lives at `/var/www/html/phpBB3/`:
+
+```bash
+# Extract the package somewhere temporary
+unzip phpbb-vb4-converter-modernized-X.Y.Z.zip -d /tmp/vb4-conv
+
+# Copy the three directories — using cp -r merges with existing dirs.
+cp -r /tmp/vb4-conv/install/   /var/www/html/phpBB3/
+cp -r /tmp/vb4-conv/phpbb/     /var/www/html/phpBB3/
+# Note: config/ contains a .fragment file you'll merge by hand in step 3.
+# The cp won't overwrite anything; it just adds vb4-related files alongside
+# what phpBB ships.
+```
+
+After this, you should have:
 
 ```
-installation/convertor/convert_vb4.php   →   phpBB/install/convertors/convert_vb4.php
-installation/convertor/functions_vb4.php →   phpBB/install/convertors/functions_vb4.php
+/var/www/html/phpBB3/install/convertors/convert_vb4.php
+/var/www/html/phpBB3/install/convertors/functions_vb4.php
+/var/www/html/phpBB3/phpbb/auth/provider/vb4.php
 ```
 
-### 2. Drop the auth provider in
+If your phpBB is installed somewhere else (e.g. `phpBB3316/`,
+`forums/`, or directly at `/var/www/html/`), substitute that path
+in the `cp` commands.
 
-```
-installation/auth_provider/vb4.php   →   phpBB/phpbb/auth/provider/vb4.php
-```
+### 2. Register the auth provider as a service
 
-### 3. Register the auth provider as a service
-
-Open `phpBB/config/default/container/services_auth.yml` and add the contents
-of `installation/services_auth.yml.fragment` underneath the existing
-`auth.provider.db:` entry. The full block:
+Open `phpBB/config/default/container/services_auth.yml` in your phpBB
+install. Add the contents of
+`config/default/container/services_auth.yml.fragment` (from this
+package) as a new entry under the existing `services:` block,
+matching the indentation of the other `auth.provider.*` entries:
 
 ```yaml
     auth.provider.vb4:
@@ -86,12 +113,12 @@ of `installation/services_auth.yml.fragment` underneath the existing
             - { name: auth.provider }
 ```
 
-> ⚠️ **YAML uses spaces, not tabs.** 4 spaces for the key, 8 for the children,
-> 12 for the dashes. If you copy the snippet through an editor that converts
-> spaces to tabs, the YAML parser will reject the whole file with a generic
-> "Indentation problem" error.
+> ⚠️ **YAML uses spaces, not tabs.** 4 spaces for the key, 8 for the
+> children, 12 for the dashes. If you copy the snippet through an
+> editor that converts spaces to tabs, the YAML parser will reject the
+> whole file with a generic "Indentation problem" error.
 
-### 4. Clear phpBB's cache
+### 3. Clear phpBB's cache
 
 After editing the YAML, clear the compiled cache so phpBB sees the new
 service:
@@ -100,17 +127,29 @@ service:
 rm -rf phpBB/cache/production/* phpBB/cache/installer/*
 ```
 
-### 5. Run the conversion
+### 4. Run the conversion
 
 Browse to:
 
 ```
-https://<your-domain>/phpBB3316/install/app.php/convert
+https://<your-domain>/phpBB3/install/app.php/convert
 ```
 
+(Adjust the `phpBB3/` path component to match your installation's
+folder name — common alternatives are `phpBB3316/`, `forums/`, or
+nothing at all if phpBB is at the document root.)
+
 Select **vBulletin 4.x.x** from the convertor list. Step through the
-configuration screens (source database credentials, table prefix, etc.)
-and click **Begin conversion**.
+configuration screens (source database credentials, table prefix,
+etc.) and click **Begin conversion**.
+
+> 💡 **About the `install/` folder name.** phpBB's stock unpack puts
+> the installer at `install/`. After you complete a conversion (or
+> any installation), phpBB recommends *renaming* `install/` to
+> something like `old.install/` so the installer routes are no longer
+> exposed but the convertor files stay around in case you need to
+> re-run them. Don't *delete* `install/` until you're 100% sure no
+> further conversion attempts are needed.
 
 ---
 
@@ -247,11 +286,12 @@ and we can adjust the schema row.
 ### Conversion completes but `phpbb_users` only has bots
 
 This was the major bug fixed in this release. If you still see it, it
-means the vb4 auth provider class isn't reachable. Verify:
+means the vb4 auth provider class isn't reachable. Verify (substitute
+your actual phpBB path):
 
 ```bash
-ls /var/www/html/phpBB3316/phpbb/auth/provider/vb4.php
-grep -A12 'auth.provider.vb4' /var/www/html/phpBB3316/config/default/container/services_auth.yml
+ls /var/www/html/phpBB3/phpbb/auth/provider/vb4.php
+grep -A12 'auth.provider.vb4' /var/www/html/phpBB3/config/default/container/services_auth.yml
 ```
 
 Both should return real content. If either is missing, redo steps 2 and 3 above and clear the cache.
@@ -259,7 +299,7 @@ Both should return real content. If either is missing, redo steps 2 and 3 above 
 ### Conversion is slow
 
 The converter processes data in batches. The default batch size in
-`convert_vb4.php` is 8000 rows per chunk, which works on most servers.
+`install/convertors/convert_vb4.php` is 8000 rows per chunk, which works on most servers.
 For very large boards (>500K posts) you may want to bump it up to ~20000
 on a beefy server, or down to ~2000 on a small one. See the comment block
 at the top of `convert_vb4.php` for guidance.
@@ -311,7 +351,7 @@ the per-row transformations are doing.
 
 ### Enabling it
 
-Open `installation/convertor/functions_vb4.php` and find the block near
+Open `install/convertors/functions_vb4.php` and find the block near
 the top:
 
 ```php

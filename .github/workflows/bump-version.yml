@@ -89,12 +89,12 @@ jobs:
           # Allow any current version value; replace just what's between the quotes.
           # Using | as sed delimiter to keep the regex readable.
           sed -i -E "s|('version'[[:space:]]*=>[[:space:]]*')[^']+(',)|\1${NEXT}\2|" \
-            installation/convertor/convert_vb4.php
+            install/convertors/convert_vb4.php
 
           # Sanity-check: file should now reference the new version.
-          if ! grep -q "'version'.*'${NEXT}'" installation/convertor/convert_vb4.php; then
+          if ! grep -q "'version'.*'${NEXT}'" install/convertors/convert_vb4.php; then
             echo "ERROR: convert_vb4.php version stamp didn't update"
-            grep "'version'" installation/convertor/convert_vb4.php || true
+            grep "'version'" install/convertors/convert_vb4.php || true
             exit 1
           fi
 
@@ -104,13 +104,13 @@ jobs:
           NEXT="${{ steps.next.outputs.next }}"
           # The line looks like:   * @version 0.0.12
           sed -i -E "s|(^\*[[:space:]]*@version[[:space:]]+).+|\1${NEXT}|" \
-            installation/auth_provider/vb4.php
+            phpbb/auth/provider/vb4.php
 
           # Sanity check.
           if ! grep -qE "^\*[[:space:]]*@version[[:space:]]+${NEXT//./\\.}$" \
-            installation/auth_provider/vb4.php; then
+            phpbb/auth/provider/vb4.php; then
             echo "ERROR: auth provider @version didn't update"
-            grep "@version" installation/auth_provider/vb4.php || true
+            grep "@version" phpbb/auth/provider/vb4.php || true
             exit 1
           fi
 
@@ -119,9 +119,9 @@ jobs:
         run: |
           # Ubuntu runners ship with PHP available.
           for f in \
-            installation/convertor/convert_vb4.php \
-            installation/convertor/functions_vb4.php \
-            installation/auth_provider/vb4.php; do
+            install/convertors/convert_vb4.php \
+            install/convertors/functions_vb4.php \
+            phpbb/auth/provider/vb4.php; do
             php -l "$f" || exit 1
           done
 
@@ -153,8 +153,8 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           git add VERSION \
-            installation/convertor/convert_vb4.php \
-            installation/auth_provider/vb4.php
+            install/convertors/convert_vb4.php \
+            phpbb/auth/provider/vb4.php
 
           # If nothing changed (e.g. somebody manually bumped the same number
           # in the same push), bail out gracefully rather than failing.
