@@ -35,7 +35,7 @@ unset($dbpasswd);
 */
 $convertor_data = array(
 	'forum_name'	=> 'vBulletin 4.x.x',
-	'version'		=> '0.0.13',
+	'version'		=> '0.0.14',
 	'phpbb_version'	=> '3.3.16',
 	'author'		=> '<a href="https://www.phpbb.com/community/memberlist.php?mode=viewprofile&u=163542">Dicky</a>, <a href="https://www.phpbb.com/community/memberlist.php?mode=viewprofile&u=304651">prototech</a> &bull; Credits to <a href="http://wlx.westgis.ac.cn/">wlx</a>',
 	'dbms'			=> $dbms,
