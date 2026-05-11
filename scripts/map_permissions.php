@@ -837,14 +837,24 @@ else
 		foreach ($forums as $forum_id => $role_name)
 		{
 			$role_id = $role_ids[$role_name];
+			$gid_safe = (int) $group_id;
+			$fid_safe = (int) $forum_id;
+			// Delete any existing acl_groups row for this (group, forum) so we
+			// don't end up with conflicting roles. phpbb_acl_groups' primary key
+			// includes auth_role_id, so REPLACE INTO alone would leave stale
+			// rows when the new role differs from a previously-set one (e.g.
+			// the phpBB installer's default ROLE_FORUM_FULL on GLOBAL_MODERATORS).
+			$db->sql_query('DELETE FROM ' . ACL_GROUPS_TABLE . "
+			                WHERE group_id = $gid_safe
+			                AND forum_id = $fid_safe");
 			$sql_ary = [
-				'group_id'      => (int) $group_id,
-				'forum_id'      => (int) $forum_id,
+				'group_id'      => $gid_safe,
+				'forum_id'      => $fid_safe,
 				'auth_option_id'=> 0,
 				'auth_role_id'  => (int) $role_id,
 				'auth_setting'  => 0,
 			];
-			$db->sql_query('REPLACE INTO ' . ACL_GROUPS_TABLE . ' ' . $db->sql_build_array('INSERT', $sql_ary));
+			$db->sql_query('INSERT INTO ' . ACL_GROUPS_TABLE . ' ' . $db->sql_build_array('INSERT', $sql_ary));
 			$inserted_acl_groups[] = "{$group_id}_{$forum_id}";
 			$applied['acl_groups']++;
 		}
@@ -854,14 +864,18 @@ else
 	foreach ($mod_plan_global as $user_id => $role_name)
 	{
 		$role_id = $role_ids[$role_name];
+		$uid_safe = (int) $user_id;
+		// Same pattern: clear any existing global rows for this user before inserting.
+		$db->sql_query('DELETE FROM ' . ACL_USERS_TABLE . "
+		                WHERE user_id = $uid_safe AND forum_id = 0");
 		$sql_ary = [
-			'user_id'       => (int) $user_id,
+			'user_id'       => $uid_safe,
 			'forum_id'      => 0,
 			'auth_option_id'=> 0,
 			'auth_role_id'  => (int) $role_id,
 			'auth_setting'  => 0,
 		];
-		$db->sql_query('REPLACE INTO ' . ACL_USERS_TABLE . ' ' . $db->sql_build_array('INSERT', $sql_ary));
+		$db->sql_query('INSERT INTO ' . ACL_USERS_TABLE . ' ' . $db->sql_build_array('INSERT', $sql_ary));
 		$inserted_acl_users[] = "{$user_id}_0";
 		$applied['acl_users']++;
 	}
@@ -871,14 +885,19 @@ else
 		foreach ($forums as $forum_id => $role_name)
 		{
 			$role_id = $role_ids[$role_name];
+			$uid_safe = (int) $user_id;
+			$fid_safe = (int) $forum_id;
+			$db->sql_query('DELETE FROM ' . ACL_USERS_TABLE . "
+			                WHERE user_id = $uid_safe
+			                AND forum_id = $fid_safe");
 			$sql_ary = [
-				'user_id'       => (int) $user_id,
-				'forum_id'      => (int) $forum_id,
+				'user_id'       => $uid_safe,
+				'forum_id'      => $fid_safe,
 				'auth_option_id'=> 0,
 				'auth_role_id'  => (int) $role_id,
 				'auth_setting'  => 0,
 			];
-			$db->sql_query('REPLACE INTO ' . ACL_USERS_TABLE . ' ' . $db->sql_build_array('INSERT', $sql_ary));
+			$db->sql_query('INSERT INTO ' . ACL_USERS_TABLE . ' ' . $db->sql_build_array('INSERT', $sql_ary));
 			$inserted_acl_users[] = "{$user_id}_{$forum_id}";
 			$applied['acl_users']++;
 		}
