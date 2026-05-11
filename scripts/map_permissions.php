@@ -162,14 +162,31 @@ $src_db->set_charset('utf8mb4');
 
 function read_source_creds(array $opts, $config): array
 {
-	return [
-		'host'   => $opts['src-host']   ?? ($config['src_dbhost']        ?? 'localhost'),
-		'port'   => $opts['src-port']   ?? ($config['src_dbport']        ?? null),
-		'user'   => $opts['src-user']   ?? ($config['src_dbuser']        ?? null),
-		'pass'   => $opts['src-pass']   ?? ($config['src_dbpasswd']      ?? null),
-		'name'   => $opts['src-name']   ?? ($config['src_dbname']        ?? null),
-		'prefix' => $opts['src-prefix'] !== '' ? $opts['src-prefix'] : ($config['src_table_prefix'] ?? ''),
-	];
+	// Fallback chain: CLI flag → src_* in phpbb_config (set during conversion)
+	// → phpBB's own DB config (which globals are set from config.php at bootstrap).
+	// The third fallback handles the common case where the converter cleared
+	// the src_* config rows after success and the user has co-located DBs.
+	global $dbhost, $dbport, $dbuser, $dbpasswd, $dbname, $table_prefix;
+
+	$host = $opts['src-host'] !== null ? $opts['src-host']
+	     : ($config['src_dbhost']   ?? $dbhost   ?? 'localhost');
+
+	$port = $opts['src-port'] !== null ? $opts['src-port']
+	     : ($config['src_dbport']   ?? $dbport   ?? null);
+
+	$user = $opts['src-user'] !== null ? $opts['src-user']
+	     : ($config['src_dbuser']   ?? $dbuser   ?? null);
+
+	$pass = $opts['src-pass'] !== null ? $opts['src-pass']
+	     : ($config['src_dbpasswd'] ?? $dbpasswd ?? null);
+
+	$name = $opts['src-name'] !== null ? $opts['src-name']
+	     : ($config['src_dbname']   ?? null);
+
+	$prefix = $opts['src-prefix'] !== '' ? $opts['src-prefix']
+	       : ($config['src_table_prefix'] ?? '');
+
+	return compact('host', 'port', 'user', 'pass', 'name', 'prefix');
 }
 
 // -----------------------------------------------------------------------
@@ -279,7 +296,17 @@ function select_forum_role(int $vb_perms): string
 		return 'ROLE_FORUM_NOACCESS';
 	}
 
-	$can_read     = ($vb_perms & VB_CAN_VIEW_THREADS) || ($vb_perms & VB_CAN_VIEW_FORUM);
+	// vB's canvote bit (131072) is widely used as a "forum visible but not
+	// readable" marker — equivalent to vB's "private" forum convention. In
+	// that mode the forum shows in the listing but you can't read threads.
+	// phpBB has no exact equivalent: ROLE_FORUM_READONLY grants thread
+	// reading. We map the canvote-only-bit-set case to NOACCESS (closer to
+	// the operator's intent on most boards), then let the admin override
+	// in the ACP if they wanted readonly access.
+	//
+	// True read access requires canviewthreads (bit 2) or canviewforum
+	// (bit 23) — both are commonly set together with other content bits.
+	$can_read     = (bool) ($vb_perms & (VB_CAN_VIEW_THREADS | VB_CAN_VIEW_FORUM));
 	$can_post     = (bool) ($vb_perms & VB_CAN_POSTNEW);
 	$can_reply    = (bool) ($vb_perms & (VB_CAN_REPLY_OWN | VB_CAN_REPLY_OTHERS));
 	$can_attach   = (bool) ($vb_perms & VB_CAN_ATTACHMENT);
@@ -290,7 +317,8 @@ function select_forum_role(int $vb_perms): string
 
 	if (!$can_read)
 	{
-		// Has canview bit set but no canviewthreads/canviewforum -- effectively no access
+		// Has some bits set but not the read bits — usually 131072 (canvote)
+		// alone, indicating a "private" forum in vB terminology.
 		return 'ROLE_FORUM_NOACCESS';
 	}
 
@@ -515,6 +543,10 @@ if (!$opts['skip-consolidation'])
 			$movable, $duplicates
 		);
 
+		// Count the plan regardless of dry-run / apply mode
+		$consolidation_summary['moved']   += $movable;
+		$consolidation_summary['dropped']++;
+
 		if (!$opts['dry-run'])
 		{
 			// Move movable rows
@@ -537,9 +569,6 @@ if (!$opts['skip-consolidation'])
 			// Drop the now-empty source group
 			$sql = 'DELETE FROM ' . GROUPS_TABLE . " WHERE group_id = $src";
 			$db->sql_query($sql);
-
-			$consolidation_summary['moved']   += $movable;
-			$consolidation_summary['dropped']++;
 		}
 	}
 
@@ -900,7 +929,181 @@ foreach ($consolidation as $vb_id => $e)
 	$report_lines[] = sprintf("vB %3d  %-30s  → %-25s  %s",
 		$vb_id, $e['vb_title'], $target_name, $e['note']);
 }
+
+// Per-forum permission plan, grouped by forum for readability
 $report_lines[] = '';
+$report_lines[] = 'PER-FORUM PERMISSIONS (planned)';
+$report_lines[] = str_repeat('-', 78);
+
+// Pivot the plan: forum_id → [target_group_id => role_name]
+$by_forum = [];
+foreach ($forum_plan as $target => $forums)
+{
+	foreach ($forums as $forum_id => $role_name)
+	{
+		$by_forum[$forum_id][$target] = $role_name;
+	}
+}
+ksort($by_forum);
+
+$private_forums = []; // forums where any target group got NOACCESS
+
+foreach ($by_forum as $forum_id => $group_roles)
+{
+	$forum_title = $phpbb_forums[$forum_id] ?? $vb_forums[$forum_id] ?? '(unknown)';
+	$report_lines[] = sprintf("Forum %d: \"%s\"", $forum_id, $forum_title);
+
+	foreach ($group_roles as $target => $role_name)
+	{
+		$gname = $phpbb_groups[$target] ?? "group_id $target";
+		$meta = $forum_plan_meta[$target][$forum_id] ?? null;
+		$vb_perms_str = '';
+		if ($meta && !empty($meta['vb_perms_seen']))
+		{
+			$unique_perms = array_unique($meta['vb_perms_seen']);
+			$vb_perms_str = ' (vB ' . implode(',', $unique_perms) . ')';
+			if (count($meta['source_vb_groups']) > 1)
+			{
+				$vb_perms_str .= ' [merged from vB groups: ' . implode(',', $meta['source_vb_groups']) . ']';
+			}
+		}
+		$marker = ($role_name === 'ROLE_FORUM_NOACCESS') ? '  ⚠ PRIVATE' : '';
+		$report_lines[] = sprintf("  %-22s  → %s%s%s",
+			$gname, $role_name, $vb_perms_str, $marker);
+
+		if ($role_name === 'ROLE_FORUM_NOACCESS')
+		{
+			$private_forums[$forum_id][] = $gname;
+		}
+	}
+	$report_lines[] = '';
+}
+
+// Private/hidden forum summary
+if (!empty($private_forums))
+{
+	$report_lines[] = 'PRIVATE / HIDDEN FORUMS (NOACCESS applied)';
+	$report_lines[] = str_repeat('-', 78);
+	foreach ($private_forums as $forum_id => $blocked_groups)
+	{
+		$forum_title = $phpbb_forums[$forum_id] ?? $vb_forums[$forum_id] ?? '(unknown)';
+		$report_lines[] = sprintf("Forum %d \"%s\": NOACCESS for %s",
+			$forum_id, $forum_title, implode(', ', $blocked_groups));
+	}
+	$report_lines[] = '';
+
+	// Build a list of warnings: cases worth manual review
+	$warnings = [];
+	foreach ($private_forums as $forum_id => $blocked_groups)
+	{
+		$forum_title = $phpbb_forums[$forum_id] ?? $vb_forums[$forum_id] ?? '';
+		$title_lower = strtolower($forum_title);
+
+		// Warn if a forum whose name suggests mod/admin scope is locking out mods
+		$suggests_mod_scope = (
+			str_contains($title_lower, 'admin')      ||
+			str_contains($title_lower, 'supermod')   ||
+			str_contains($title_lower, 'moderator')  ||
+			str_contains($title_lower, 'staff')
+		);
+		if ($suggests_mod_scope && in_array('GLOBAL_MODERATORS', $blocked_groups, true))
+		{
+			$warnings[] = sprintf("Forum %d \"%s\": name suggests mod scope but GLOBAL_MODERATORS is locked out (vB had 131072 'canvote-only' for that group). REVIEW: should mods have read access here?",
+				$forum_id, $forum_title);
+		}
+	}
+
+	if (!empty($warnings))
+	{
+		$report_lines[] = 'WARNINGS — manual review recommended';
+		$report_lines[] = str_repeat('-', 78);
+		$report_lines[] = 'The following permissions look ambiguous. vB used the canvote bit (131072)';
+		$report_lines[] = 'inconsistently — some boards used it as "read-only" and others as "private".';
+		$report_lines[] = 'These cases were mapped to NOACCESS by default; review in ACP and switch';
+		$report_lines[] = 'to ROLE_FORUM_READONLY if the affected group should have read access.';
+		$report_lines[] = '';
+		foreach ($warnings as $w)
+		{
+			$report_lines[] = "  - $w";
+		}
+		$report_lines[] = '';
+	}
+}
+
+// Moderator assignments
+if (!$opts['skip-moderators'])
+{
+	$report_lines[] = 'MODERATOR ASSIGNMENTS';
+	$report_lines[] = str_repeat('-', 78);
+
+	if (!empty($mod_plan_global))
+	{
+		$report_lines[] = 'Global super-moderators (across all forums):';
+		// Get usernames
+		$mod_uids = implode(',', array_map('intval', array_keys($mod_plan_global)));
+		$usernames = [];
+		if ($mod_uids)
+		{
+			$sql = 'SELECT user_id, username FROM ' . USERS_TABLE . " WHERE user_id IN ($mod_uids)";
+			$result = $db->sql_query($sql);
+			while ($row = $db->sql_fetchrow($result))
+			{
+				$usernames[(int) $row['user_id']] = $row['username'];
+			}
+			$db->sql_freeresult($result);
+		}
+		foreach ($mod_plan_global as $uid => $role)
+		{
+			$uname = $usernames[$uid] ?? "user_id $uid";
+			$report_lines[] = sprintf("  %-30s (user_id %d)  → %s",
+				$uname, $uid, $role);
+		}
+		$report_lines[] = '';
+	}
+
+	if (!empty($mod_plan_forum))
+	{
+		$report_lines[] = 'Per-forum moderators:';
+		// Collect all uids we need names for
+		$all_uids = [];
+		foreach ($mod_plan_forum as $uid => $f) $all_uids[$uid] = true;
+		$mod_uids = implode(',', array_map('intval', array_keys($all_uids)));
+		$usernames = [];
+		if ($mod_uids)
+		{
+			$sql = 'SELECT user_id, username FROM ' . USERS_TABLE . " WHERE user_id IN ($mod_uids)";
+			$result = $db->sql_query($sql);
+			while ($row = $db->sql_fetchrow($result))
+			{
+				$usernames[(int) $row['user_id']] = $row['username'];
+			}
+			$db->sql_freeresult($result);
+		}
+
+		// Print sorted by forum for readability
+		$by_forum_mods = [];
+		foreach ($mod_plan_forum as $uid => $forums)
+		{
+			foreach ($forums as $fid => $role)
+			{
+				$by_forum_mods[$fid][] = ['uid' => $uid, 'role' => $role];
+			}
+		}
+		ksort($by_forum_mods);
+		foreach ($by_forum_mods as $fid => $entries)
+		{
+			$forum_title = $phpbb_forums[$fid] ?? '(unknown)';
+			$report_lines[] = sprintf("  Forum %d (%s):", $fid, $forum_title);
+			foreach ($entries as $e)
+			{
+				$uname = $usernames[$e['uid']] ?? "user_id {$e['uid']}";
+				$report_lines[] = sprintf("    %-30s → %s", $uname, $e['role']);
+			}
+		}
+		$report_lines[] = '';
+	}
+}
+
 $report_lines[] = 'SUMMARY';
 $report_lines[] = str_repeat('-', 78);
 $report_lines[] = "Group consolidation:";
@@ -908,6 +1111,7 @@ $report_lines[] = "  user_group rows moved: {$consolidation_summary['moved']}";
 $report_lines[] = "  duplicate groups dropped: {$consolidation_summary['dropped']}";
 $report_lines[] = "Permission mapping:";
 $report_lines[] = "  Forum permission rules: $forum_rules_count";
+$report_lines[] = "  Private forums (NOACCESS applied): " . count($private_forums);
 $report_lines[] = "  Global moderator assignments: " . count($mod_plan_global);
 $per_forum_mods = 0;
 foreach ($mod_plan_forum as $u => $f) $per_forum_mods += count($f);
