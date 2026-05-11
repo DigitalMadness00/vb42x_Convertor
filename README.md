@@ -194,7 +194,37 @@ finishes:
    appear in search results until the index is built. The default Native
    Fulltext driver works fine on most boards.
 3. **Forum permissions** — vBulletin's permission model doesn't map cleanly
-   onto phpBB's. Review private/hidden forums and admin/mod assignments.
+   onto phpBB's. **Use the included permission-mapping script** to handle
+   group consolidation and per-forum ACL setup automatically:
+
+   ```bash
+   # Preview what will change (no writes):
+   php scripts/map_permissions.php --dry-run
+
+   # Apply:
+   php scripts/map_permissions.php
+   ```
+
+   The script:
+   - Consolidates duplicate `vB - *` groups into phpBB's system groups
+     (REGISTERED, GLOBAL_MODERATORS, ADMINISTRATORS) so each user is in
+     one canonical group
+   - Maps vB forum-permission bitfields to phpBB ACL roles per-group,
+     per-forum, including private/hidden forums
+   - Maps the vB `moderator` table to per-user, per-forum moderator
+     assignments
+   - Preserves custom groups (e.g. clan groups, special-access groups)
+     with their permissions
+
+   Output: a detailed report at `/tmp/vb4_perm_report.txt` plus stdout
+   plus entries in the phpBB ACP log. Run `--dry-run` first to verify
+   the plan before applying. Re-running is idempotent.
+
+   See [docs/permission_mapping_design.md](./docs/permission_mapping_design.md)
+   for the full specification, mapping tables, and acceptance tests.
+
+   Even after running the script, **review forum permissions in the ACP**
+   for any that the script flagged as needing manual attention.
 4. **Reassign orphan posts** — if your source vB had posts authored by
    user IDs that no longer existed in vB's user table (typical for users
    who deleted their accounts), those posts are imported with

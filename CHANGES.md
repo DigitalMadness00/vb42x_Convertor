@@ -3,6 +3,36 @@
 The original converter (2008-2013) targeted phpBB 3.0.11 and PHP 5.x. These
 are the fixes required to make it work against phpBB 3.3.x on PHP 7+/8.x.
 
+## New in this release
+
+- **Permission-mapping script** (`scripts/map_permissions.php`) — handles
+  the post-conversion ACP-permissions setup that previously required hours
+  of manual clicking. The script:
+  - Consolidates the duplicate `vB - *` group hierarchy that the original
+    converter creates (every user ended up in both `vB - Registered` and
+    phpBB's `REGISTERED`) into a single canonical group per user.
+  - Maps vB forum-permission bitfields to phpBB ACL roles per-group,
+    per-forum. Decodes the bitfield, picks the closest-matching role
+    (`ROLE_FORUM_NOACCESS` → `ROLE_FORUM_READONLY` → `ROLE_FORUM_LIMITED`
+    → `ROLE_FORUM_STANDARD` → `ROLE_FORUM_FULL`), inserts into
+    `phpbb_acl_groups`.
+  - Maps vB's `moderator` table to per-user, per-forum moderator
+    assignments via `phpbb_acl_users` — including global super-moderators
+    (vB `forumid = -1` rows).
+  - Preserves custom groups (Rebourne, clan groups, etc.) with their
+    permissions intact.
+  - Locks down private/hidden forums (vB forums where some groups had
+    `forumpermissions = 0`) with `ROLE_FORUM_NOACCESS`.
+  - Provides a `--dry-run` flag for previewing the plan before applying.
+  - Idempotent: re-running cleans up prior writes via a `phpbb_log` tag
+    and re-applies.
+  - Outputs a detailed report to `/tmp/vb4_perm_report.txt` plus stdout
+    plus phpBB ACP log entries.
+
+  See [docs/permission_mapping_design.md](./docs/permission_mapping_design.md)
+  for the full mapping rules, role-selection algorithm, conflict
+  resolution, and acceptance tests.
+
 ## PHP language fixes
 
 | Original | Issue | Fix |
