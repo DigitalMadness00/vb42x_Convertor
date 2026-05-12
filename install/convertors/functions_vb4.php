@@ -982,36 +982,104 @@ function vb_reformat_inline_attach(&$message, $post_id)
 {
 	global $src_db, $convert, $same_db;
 
-	// Do a simple check for the presence of opening and closing tags before continuing.
-	if (strpos($message, '[ATTACH=CONFIG]') !== false && strpos($message, '[/ATTACH]') !== false)
+	$has_attach_config = (strpos($message, '[ATTACH=CONFIG]') !== false && strpos($message, '[/ATTACH]') !== false);
+	$has_attach_plain  = (strpos($message, '[ATTACH]') !== false && strpos($message, '[/ATTACH]') !== false);
+	$has_attach_url    = (stripos($message, 'attachment.php?attachmentid=') !== false);
+
+	if (!$has_attach_config && !$has_attach_plain && !$has_attach_url)
 	{
-		if ($convert->mysql_convert && $same_db)
-		{
-			$src_db->sql_query("SET NAMES 'binary'");
-		}
-		// We need to grab some info from the database :-/
-		$sql = 'SELECT attachmentid, filename
-			FROM ' . $convert->src_table_prefix . 'attachment
-			WHERE contenttypeid = 1
-				AND contentid = ' . (int) $post_id . '
-			ORDER BY attachmentid DESC';
-		$result = $src_db->sql_query($sql);
-		$i = 1;
+		return;
+	}
 
-		while ($row = $src_db->sql_fetchrow($result))
-		{
-			$find = '[ATTACH=CONFIG]' . $row['attachmentid'] . '[/ATTACH]';
-			$replace = '[attachment=' . $i . ']' . $row['filename'] . '[/attachment]';
+	if ($convert->mysql_convert && $same_db)
+	{
+		$src_db->sql_query("SET NAMES 'binary'");
+	}
 
-			$message = str_replace($find, $replace, $message); 
-		}
-		$src_db->sql_freeresult($result);
+	// Fetch all attachments for this post: their attachmentid and filename.
+	$sql = 'SELECT attachmentid, filename
+		FROM ' . $convert->src_table_prefix . 'attachment
+		WHERE contenttypeid = 1
+			AND contentid = ' . (int) $post_id . '
+		ORDER BY attachmentid DESC';
+	$result = $src_db->sql_query($sql);
 
-		if ($convert->mysql_convert && $same_db)
+	$index = 1;
+	$attach_by_id = array();
+	while ($row = $src_db->sql_fetchrow($result))
+	{
+		$attach_by_id[(int) $row['attachmentid']] = array(
+			'index'    => $index,
+			'filename' => $row['filename'],
+		);
+		$index++;
+	}
+	$src_db->sql_freeresult($result);
+
+	// Pattern 1: [ATTACH=CONFIG]N[/ATTACH] - newer vB inline-attachment BBCode
+	foreach ($attach_by_id as $attachmentid => $info)
+	{
+		$find    = '[ATTACH=CONFIG]' . $attachmentid . '[/ATTACH]';
+		$replace = '[attachment=' . $info['index'] . ']' . $info['filename'] . '[/attachment]';
+		$message = str_replace($find, $replace, $message);
+	}
+
+	// Pattern 2: [ATTACH]N[/ATTACH] - older vB inline-attachment BBCode (no =CONFIG)
+	foreach ($attach_by_id as $attachmentid => $info)
+	{
+		$find    = '[ATTACH]' . $attachmentid . '[/ATTACH]';
+		$replace = '[attachment=' . $info['index'] . ']' . $info['filename'] . '[/attachment]';
+		$message = str_replace($find, $replace, $message);
+	}
+
+	// Pattern 3: [IMG]<local_bburl>/attachment.php?attachmentid=N[...][/IMG]
+	// Users sometimes manually pasted the attachment URL inside [IMG] BBCode.
+	// We rewrite these too IF the URL host matches vB's bburl AND the referenced
+	// attachment belongs to this post (contentid matches the current post_id).
+	if ($has_attach_url && !empty($attach_by_id))
+	{
+		// Build a regex that matches the local bburl. The vB convert framework
+		// exposes the source bburl via $convert->options['src_url'] when set,
+		// or we fall back to the bburl from vbsetting.
+		$bburl = vb_get_bburl();
+		if ($bburl !== '')
 		{
-			$src_db->sql_query("SET NAMES 'utf8'");
+			$bburl_pattern = preg_quote(preg_replace('#^https?://#i', '', rtrim($bburl, '/')), '/');
+			$bburl_pattern = '(?:www\.)?' . preg_replace('/^www\\\\\./', '', $bburl_pattern);
+
+			foreach ($attach_by_id as $attachmentid => $info)
+			{
+				$attach_re = '/\[IMG\]https?:\/\/' . $bburl_pattern . '\/attachment\.php\?attachmentid=' . (int) $attachmentid . '[^\[]*\[\/IMG\]/i';
+				$replace = '[attachment=' . $info['index'] . ']' . $info['filename'] . '[/attachment]';
+				$message = preg_replace($attach_re, $replace, $message);
+			}
 		}
 	}
+
+	if ($convert->mysql_convert && $same_db)
+	{
+		$src_db->sql_query("SET NAMES 'utf8'");
+	}
+}
+
+/**
+* Read vBulletin's bburl setting from the source database.
+* Cached per request.
+*/
+function vb_get_bburl()
+{
+	global $src_db, $convert;
+	static $cached = null;
+
+	if ($cached !== null) return $cached;
+
+	$sql = 'SELECT value FROM ' . $convert->src_table_prefix . "setting WHERE varname = 'bburl'";
+	$result = $src_db->sql_query($sql);
+	$row = $src_db->sql_fetchrow($result);
+	$src_db->sql_freeresult($result);
+
+	$cached = $row ? (string) $row['value'] : '';
+	return $cached;
 }
 
 /**
