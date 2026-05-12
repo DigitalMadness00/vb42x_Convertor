@@ -269,7 +269,36 @@ the individual scripts directly:
 
    Even after running the script, **review forum permissions in the ACP**
    for any that the script flagged as needing manual attention.
-4. **Reassign orphan posts** — if your source vB had posts authored by
+
+4. **Fix broken attachment markup** — vBulletin used two attachment-BBCode
+   formats (`[ATTACH]N[/ATTACH]` and `[ATTACH=CONFIG]N[/ATTACH]`) plus
+   raw URL embeds. The convertor handles `[ATTACH=CONFIG]` correctly but
+   the older `[ATTACH]N[/ATTACH]` and raw `[IMG]http://.../attachment.php?attachmentid=N[/IMG]`
+   patterns are left as broken text/dead links. Use:
+
+   ```bash
+   # Preview:
+   php scripts/fix_attachment_urls.php --dry-run
+
+   # Apply:
+   php scripts/fix_attachment_urls.php
+
+   # Apply + invoke phpBB's textformatter reparser (15-30 minutes, optional):
+   php scripts/fix_attachment_urls.php --reparse
+   ```
+
+   The script:
+   - Rewrites both broken patterns to phpBB's `[attachment=I]filename[/attachment]` BBCode
+   - Leaves external URLs (other forums) alone — `--vb-url` flag controls
+     which hosts are treated as local
+   - Looks up filenames from `phpbb_attachments`, assigns per-post indices
+   - Marks affected posts with `post_attachment=1`
+   - Optionally invokes phpBB's reparser to rebuild stored XML
+
+   Idempotent: re-running skips posts that already have valid `[attachment=N]`
+   markup.
+
+5. **Reassign orphan posts** — if your source vB had posts authored by
    user IDs that no longer existed in vB's user table (typical for users
    who deleted their accounts), those posts are imported with
    non-existent `poster_id` values. Reassign them to anonymous:
@@ -569,4 +598,3 @@ When reporting bugs, please include:
 
 For schema-related issues, the relevant SQL error message (with the column
 name) is usually enough to pinpoint the fix.
-

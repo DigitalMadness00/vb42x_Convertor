@@ -37,9 +37,20 @@ $opts = [
 	'dry-run'          => false,
 	'yes'              => false,
 	'reparse'          => false,
+	'skip-posts'       => false,
+	'skip-signatures'  => false,
+	'skip-pms'         => false,
+	'skip-postid'      => false,   // skip Pattern D (postid=N URL lookups)
 	'report-file'      => '/tmp/vb4_attachment_fix_report.txt',
 	'phpbb-root'       => __DIR__ . '/..',
 	'vb-url'           => [],   // array - can be specified multiple times
+	// Source DB - optional, only needed for Pattern D (postid=N URLs)
+	'src-host'         => null,
+	'src-port'         => null,
+	'src-user'         => null,
+	'src-pass'         => null,
+	'src-name'         => null,
+	'src-prefix'       => '',
 ];
 
 foreach (array_slice($argv, 1) as $arg)
@@ -88,10 +99,16 @@ function print_help()
 	echo <<<HELP
 vBulletin → phpBB 3.3 attachment-URL fixer
 
-Rewrites broken vBulletin attachment markup in post_text:
+Rewrites broken vBulletin attachment markup in three places:
+  - phpbb_posts.post_text       (rewrites to [attachment=I]filename[/attachment])
+  - phpbb_users.user_sig        (rewrites URL to ./download/file.php?id=N)
+  - phpbb_privmsgs.message_text (rewrites URL to ./download/file.php?id=N)
+
+Three patterns are fixed in each:
   - [ATTACH]N[/ATTACH] (old vB BBCode)
-  - [IMG]<local_url>/attachment.php?attachmentid=N[/IMG] (raw URLs)
-Both get rewritten as phpBB's native [attachment=I]filename[/attachment] BBCode.
+  - URL embeds pointing at /attachment.php?attachmentid=N
+  - URL embeds pointing at /attachment.php?...postid=N (older vB2/3 form;
+    requires source-DB access to resolve postid→attach_id)
 
 External attachment URLs (pointing at other forums) are left untouched.
 
@@ -101,25 +118,36 @@ Usage:
 Options:
   --dry-run                 Preview changes without applying.
   -y, --yes                 Skip the interactive confirmation prompt.
-  --reparse                 After fixing, invoke phpBB's textformatter reparser
-                            (php bin/phpbbcli.php reparser:reparse post_text).
-                            This rebuilds the stored XML for ALL posts in the
-                            board, not just the ones we touched. Takes 15-30
-                            minutes on a 250k-post board.
+  --reparse                 After fixing, invoke phpBB's textformatter reparser.
+                            Takes 15-30 minutes on a 250k-post board (does
+                            posts, signatures, AND PMs).
+  --skip-posts              Skip the post_text scan/fix.
+  --skip-signatures         Skip the user_sig scan/fix.
+  --skip-pms                Skip the privmsg message_text scan/fix.
+  --skip-postid             Skip Pattern D (postid=N URL handling). Use this
+                            if you don't have source-DB access or don't need
+                            legacy URL handling.
   --vb-url=<url>            A vBulletin URL to treat as "local" - URLs at this
                             host are rewritten, others are left alone. Specify
-                            multiple times for multiple historical paths:
+                            multiple times for multiple paths:
                               --vb-url=http://example.com/forums
                               --vb-url=http://example.com/forum
+                              --vb-url=http://example.com
                             If not specified, the script attempts to detect a
                             sensible default from phpbb_config[server_name].
+  --src-host=<host>         Source (vB) DB host. Required for --skip-postid=false.
+  --src-port=<port>         Source DB port (default 3306).
+  --src-user=<user>         Source DB user.
+  --src-pass=<pass>         Source DB password.
+  --src-name=<dbname>       Source DB name (the vBulletin database).
+  --src-prefix=<prefix>     Source table prefix (default empty).
   --report-file=<path>      Where to write the report (default
                             /tmp/vb4_attachment_fix_report.txt).
   --phpbb-root=<path>       Path to phpBB install root (default: parent of script).
   -h, --help                Show this help.
 
-The script is idempotent: posts that already have [attachment=I]filename[/attachment]
-markup are skipped. Re-running is safe.
+The script is idempotent: rows already pointing at ./download/file.php?id=N or
+containing [attachment=I] BBCode are skipped. Re-running is safe.
 
 HELP;
 }
@@ -257,17 +285,126 @@ $db->sql_freeresult($result);
 echo "  Loaded " . count($attachments) . " attachment records.\n\n";
 
 // -----------------------------------------------------------------------
-// Scan post_text for fixable patterns
+// Optional: build postid → attach_id map from source vB DB
+// -----------------------------------------------------------------------
+//
+// Older vBulletin versions used attachment.php?postid=N URLs (where N was a
+// vB post id, not an attachment id). To rewrite these to phpBB's
+// download/file.php?id=N format, we need to look up which attachment
+// belongs to each vB post. The mapping comes from vB.attachment.contentid
+// (the post id) → vB.attachment.attachmentid (which equals phpBB attach_id).
+
+$postid_to_attach_id = [];   // vb_postid => phpbb_attach_id
+
+if (!$opts['skip-postid'])
+{
+	// Need source DB credentials.
+	if (!$opts['src-host'] || !$opts['src-user'] || $opts['src-pass'] === null || !$opts['src-name'])
+	{
+		echo "Postid URL handling enabled but source DB credentials not provided.\n";
+		echo "Pass --src-host, --src-user, --src-pass, --src-name to enable Pattern D.\n";
+		echo "Or pass --skip-postid to suppress this message.\n\n";
+		echo "Continuing WITHOUT postid lookup (legacy URLs will be left alone)...\n\n";
+	}
+	else
+	{
+		echo "Connecting to source vB DB at {$opts['src-host']} ({$opts['src-name']})...\n";
+
+		$src_db = new mysqli(
+			$opts['src-host'],
+			$opts['src-user'],
+			$opts['src-pass'],
+			$opts['src-name'],
+			(int) ($opts['src-port'] ?: 3306)
+		);
+		if ($src_db->connect_error)
+		{
+			fwrite(STDERR, "Source DB connection failed: {$src_db->connect_error}\n");
+			fwrite(STDERR, "Pass --skip-postid to continue without postid URL handling.\n");
+			exit(1);
+		}
+		$src_db->set_charset('utf8mb4');
+
+		// First, gather every postid referenced in the destination tables
+		echo "  Scanning for postid references in posts/sigs/PMs...\n";
+
+		$postid_set = [];
+		$collect_postids = function ($table, $column, $pk) use ($db, &$postid_set) {
+			$sql = "SELECT $pk, $column FROM $table
+			        WHERE $column LIKE '%attachment.php?%postid=%'
+			        OR $column LIKE '%attachment.php?postid=%'";
+			$result = $db->sql_query($sql);
+			while ($row = $db->sql_fetchrow($result))
+			{
+				if (preg_match_all('/attachment\.php\?[^"]*postid=(\d+)/i', $row[$column], $matches))
+				{
+					foreach ($matches[1] as $pid)
+					{
+						$postid_set[(int) $pid] = true;
+					}
+				}
+			}
+			$db->sql_freeresult($result);
+		};
+
+		if (!$opts['skip-posts'])      $collect_postids(POSTS_TABLE,    'post_text',    'post_id');
+		if (!$opts['skip-signatures']) $collect_postids(USERS_TABLE,    'user_sig',     'user_id');
+		if (!$opts['skip-pms'])        $collect_postids(PRIVMSGS_TABLE, 'message_text', 'msg_id');
+
+		echo "  Found " . count($postid_set) . " distinct postid references.\n";
+
+		// Now look up each postid in vB.attachment to find its attachmentid.
+		// If a post had multiple attachments, pick the smallest attachmentid
+		// (matches vB's default "render first attachment" behavior).
+		if (!empty($postid_set))
+		{
+			$src_prefix = $opts['src-prefix'];
+			$postid_list = implode(',', array_map('intval', array_keys($postid_set)));
+			$sql = "SELECT contentid AS vb_postid, MIN(attachmentid) AS attach_id
+			        FROM `{$src_prefix}attachment`
+			        WHERE contenttypeid = 1
+			          AND contentid IN ($postid_list)
+			        GROUP BY contentid";
+			$res = $src_db->query($sql);
+			if (!$res)
+			{
+				fwrite(STDERR, "Source-DB lookup failed: {$src_db->error}\n");
+				fwrite(STDERR, "Continuing without postid resolution.\n");
+			}
+			else
+			{
+				while ($row = $res->fetch_assoc())
+				{
+					$attach_id = (int) $row['attach_id'];
+					// Only accept the mapping if the destination has this attach_id
+					if (isset($attachments[$attach_id]))
+					{
+						$postid_to_attach_id[(int) $row['vb_postid']] = $attach_id;
+					}
+				}
+				$res->free();
+			}
+
+			$resolved = count($postid_to_attach_id);
+			$unresolved = count($postid_set) - $resolved;
+			echo "  Resolved: $resolved postids → attach_ids\n";
+			echo "  Unresolved: $unresolved (attachment missing from source vB or destination)\n\n";
+		}
+
+		$src_db->close();
+	}
+}
+
+// -----------------------------------------------------------------------
+// Scan post_text / user_sig / privmsgs.message_text for fixable patterns
 // -----------------------------------------------------------------------
 
-echo "Scanning posts for fixable patterns...\n";
-
 // Pattern A: [ATTACH]N[/ATTACH] - vB old format BBCode
-//   Note: vB-style XML in stored post_text uses [ATTACH] inside <t>...</t>
+//   Note: vB-style XML in stored text uses [ATTACH] inside <t>...</t>
 $pattern_attach = '/\[ATTACH\](\d+)\[\/ATTACH\]/';
 
 // Pattern B: [IMG]http://<local>/attachment.php?attachmentid=N[...][/IMG]
-//   This catches the raw BBCode form (appears in <t>-wrapped plaintext posts).
+//   This catches the raw BBCode form (appears in <t>-wrapped plaintext rows).
 $pattern_img = '/\[IMG\](?:https?:\/\/(?:' . $url_pattern . ')\/attachment\.php\?attachmentid=(\d+)[^\[]*)\[\/IMG\]/i';
 
 // Pattern C: phpBB's parsed XML form of an [IMG] tag that wraps an
@@ -278,179 +415,405 @@ $pattern_img = '/\[IMG\](?:https?:\/\/(?:' . $url_pattern . ')\/attachment\.php\
 // inside lets us span across the entire structure.
 $pattern_img_xml = '/<IMG\s+src="https?:\/\/(?:' . $url_pattern . ')\/attachment\.php\?attachmentid=(\d+)[^"]*"[^>]*>[\s\S]*?<\/IMG>/i';
 
-$query_chunk = 500;
-$total_posts_scanned = 0;
-$total_attach_fixes = 0;
-$total_img_fixes    = 0;
-$posts_to_update = [];   // post_id => new_post_text
-$lookup_misses = [];
-$sample_changes = [];
+// Pattern D (legacy): older vB postid=N URLs.
+// vB2/vB3 used attachment.php?postid=N (or ?s=&postid=N) to reference the
+// first attachment of a post. Requires postid_to_attach_id lookup table.
+// Match both the raw [IMG] BBCode form and the parsed XML form.
+$pattern_img_postid     = '/\[IMG\](?:https?:\/\/(?:' . $url_pattern . ')\/attachment\.php\?[^\[]*?postid=(\d+)[^\[]*)\[\/IMG\]/i';
+$pattern_img_xml_postid = '/<IMG\s+src="https?:\/\/(?:' . $url_pattern . ')\/attachment\.php\?[^"]*?postid=(\d+)[^"]*"[^>]*>[\s\S]*?<\/IMG>/i';
 
-$sql = 'SELECT COUNT(*) AS n FROM ' . POSTS_TABLE . "
-        WHERE post_text LIKE '%[ATTACH]%'
-        OR post_text LIKE '%attachment.php?attachmentid=%'";
-$result = $db->sql_query($sql);
-$candidate_post_count = (int) $db->sql_fetchfield('n');
-$db->sql_freeresult($result);
-
-echo "  Candidate posts (containing [ATTACH] or attachment.php): " . number_format($candidate_post_count) . "\n";
-
-$offset = 0;
-while (true)
+/**
+* Scan a text column and produce rewrites.
+*
+* @param array  $context Lookup data and accumulators (passed by reference for stats)
+* @param string $text    The current row's text
+* @param int    $row_id  The row's primary key (for misses logging)
+* @param string $row_type 'post', 'sig', or 'pm'
+* @param string $mode    'bbcode' (produces [attachment=I]filename[/attachment]) or
+*                        'url' (produces <IMG src="./download/file.php?id=N">)
+* @return string|null Rewritten text, or null if nothing changed
+*/
+function rewrite_text(array &$context, string $text, int $row_id, string $row_type, string $mode): ?string
 {
-	$sql = 'SELECT post_id, post_text
-	        FROM ' . POSTS_TABLE . "
-	        WHERE post_text LIKE '%[ATTACH]%'
-	        OR post_text LIKE '%attachment.php?attachmentid=%'
-	        ORDER BY post_id
-	        LIMIT $offset, $query_chunk";
-	$result = $db->sql_query($sql);
+	global $pattern_attach, $pattern_img, $pattern_img_xml;
+	global $pattern_img_postid, $pattern_img_xml_postid;
 
-	$batch_count = 0;
-	while ($row = $db->sql_fetchrow($result))
+	$original = $text;
+	$post_index = 0;
+	$index_for_attach = [];
+	$row_label = "$row_type $row_id";
+
+	// Pre-compute set of filenames that ALREADY have <ATTACHMENT> blocks
+	// in this row's text. These were created by phpBB's reparser from prior
+	// runs. We must skip substitutions whose filename matches, otherwise
+	// we'd double-render the same attachment.
+	$existing_attachments = [];
+	if (preg_match_all('/<ATTACHMENT\s+filename="([^"]+)"/', $text, $matches))
 	{
-		$batch_count++;
-		$total_posts_scanned++;
-		$post_id = (int) $row['post_id'];
-		$post_text = $row['post_text'];
-		$original_post_text = $post_text;
-
-		// Per-post counter: assign sequential [attachment=I] indices for
-		// each unique attachment_id we substitute into this post.
-		$post_index = 0;
-		$index_for_attach = [];
-
-		// --- Pattern A: [ATTACH]N[/ATTACH] ---
-		$post_text = preg_replace_callback(
-			$pattern_attach,
-			function ($m) use ($attachments, &$post_index, &$index_for_attach, &$lookup_misses, $post_id, &$total_attach_fixes)
-			{
-				$attach_id = (int) $m[1];
-				if (!isset($attachments[$attach_id]))
-				{
-					$lookup_misses[] = ['post_id' => $post_id, 'attach_id' => $attach_id, 'pattern' => 'ATTACH'];
-					return $m[0]; // leave as-is
-				}
-				$filename = $attachments[$attach_id]['filename'];
-				if (!isset($index_for_attach[$attach_id]))
-				{
-					$index_for_attach[$attach_id] = $post_index++;
-				}
-				$index = $index_for_attach[$attach_id];
-				$total_attach_fixes++;
-				return "[attachment=$index]$filename" . "[/attachment]";
-			},
-			$post_text
-		);
-
-		// --- Pattern B: [IMG]<local-url>/attachment.php?attachmentid=N[...][/IMG] (raw BBCode form) ---
-		$post_text = preg_replace_callback(
-			$pattern_img,
-			function ($m) use ($attachments, &$post_index, &$index_for_attach, &$lookup_misses, $post_id, &$total_img_fixes)
-			{
-				$attach_id = (int) $m[1];
-				if (!isset($attachments[$attach_id]))
-				{
-					$lookup_misses[] = ['post_id' => $post_id, 'attach_id' => $attach_id, 'pattern' => 'IMG-local'];
-					return $m[0];
-				}
-				$filename = $attachments[$attach_id]['filename'];
-				if (!isset($index_for_attach[$attach_id]))
-				{
-					$index_for_attach[$attach_id] = $post_index++;
-				}
-				$index = $index_for_attach[$attach_id];
-				$total_img_fixes++;
-				return "[attachment=$index]$filename" . "[/attachment]";
-			},
-			$post_text
-		);
-
-		// --- Pattern C: phpBB's parsed XML <IMG ...>...</IMG> wrapping a local attachment.php URL ---
-		$post_text = preg_replace_callback(
-			$pattern_img_xml,
-			function ($m) use ($attachments, &$post_index, &$index_for_attach, &$lookup_misses, $post_id, &$total_img_fixes)
-			{
-				$attach_id = (int) $m[1];
-				if (!isset($attachments[$attach_id]))
-				{
-					$lookup_misses[] = ['post_id' => $post_id, 'attach_id' => $attach_id, 'pattern' => 'IMG-xml'];
-					return $m[0];
-				}
-				$filename = $attachments[$attach_id]['filename'];
-				if (!isset($index_for_attach[$attach_id]))
-				{
-					$index_for_attach[$attach_id] = $post_index++;
-				}
-				$index = $index_for_attach[$attach_id];
-				$total_img_fixes++;
-				return "[attachment=$index]$filename" . "[/attachment]";
-			},
-			$post_text
-		);
-
-		// Also clean up the XML-wrapped URLs from phpBB's textformatter parse.
-		// These would otherwise remain in <r>/<t> form with the old attachment.php URL.
-		// We don't replace these directly - we let phpBB's reparser handle them when
-		// it sees the new [attachment] BBCode.
-
-		if ($post_text !== $original_post_text)
+		foreach ($matches[1] as $fn)
 		{
-			$posts_to_update[$post_id] = $post_text;
-
-			if (count($sample_changes) < 5)
-			{
-				// Find the first position where original and new diverge,
-				// then show 80 chars of context before + 200 after, so the
-				// change is always visible in the sample (not lost beyond
-				// a fixed-position truncation window).
-				$diff_pos = 0;
-				$min_len = min(strlen($original_post_text), strlen($post_text));
-				for ($i = 0; $i < $min_len; $i++)
-				{
-					if ($original_post_text[$i] !== $post_text[$i])
-					{
-						$diff_pos = $i;
-						break;
-					}
-				}
-				$start = max(0, $diff_pos - 80);
-
-				$sample_changes[] = [
-					'post_id'  => $post_id,
-					'before'   => mb_substr($original_post_text, $start, 280),
-					'after'    => mb_substr($post_text,           $start, 280),
-				];
-			}
+			$existing_attachments[$fn] = true;
 		}
 	}
 
-	$db->sql_freeresult($result);
+	$is_duplicate = function ($attach_id) use ($context, $existing_attachments, $row_id, $row_type) {
+		if (!isset($context['attachments'][$attach_id])) return false;
+		$filename = $context['attachments'][$attach_id]['filename'];
+		if (isset($existing_attachments[$filename]))
+		{
+			$GLOBALS['_skipped_duplicates'][] = ['row_id' => $row_id, 'attach_id' => $attach_id, 'filename' => $filename, 'row_type' => $row_type];
+			return true;
+		}
+		return false;
+	};
 
-	if ($batch_count < $query_chunk) break;
-	$offset += $query_chunk;
-	if ($offset % 5000 === 0)
-	{
-		echo "  Scanned " . number_format($offset) . " posts...\n";
-	}
+	$make_replacement = function ($attach_id, $filename) use (&$post_index, &$index_for_attach, $mode) {
+		if (!isset($index_for_attach[$attach_id]))
+		{
+			$index_for_attach[$attach_id] = $post_index++;
+		}
+		$index = $index_for_attach[$attach_id];
+		if ($mode === 'bbcode')
+		{
+			return "[attachment=$index]$filename" . "[/attachment]";
+		}
+		// 'url' mode: produce a phpBB-flavored <IMG> XML pointing at download/file.php.
+		// We construct just <IMG src="...">...</IMG> with the URL, expecting that
+		// phpBB's reparser will rebuild proper textformatter XML afterward.
+		return '<IMG src="./download/file.php?id=' . (int) $attach_id . '"><s>[img]</s><URL url="./download/file.php?id=' . (int) $attach_id . '"><LINK_TEXT text="./download/file.php?id=' . (int) $attach_id . '">./download/file.php?id=' . (int) $attach_id . '</LINK_TEXT></URL><e>[/img]</e></IMG>';
+	};
+
+	// --- Pattern A: [ATTACH]N[/ATTACH] ---
+	$text = preg_replace_callback(
+		$pattern_attach,
+		function ($m) use ($context, $make_replacement, $is_duplicate, $row_id, $row_label, $row_type) {
+			$attach_id = (int) $m[1];
+			if (!isset($context['attachments'][$attach_id]))
+			{
+				$GLOBALS['_lookup_misses'][] = ['row_id' => $row_id, 'attach_id' => $attach_id, 'pattern' => 'ATTACH', 'row_type' => $row_type];
+				return $m[0];
+			}
+			if ($is_duplicate($attach_id))
+			{
+				return $m[0];  // leave the raw [ATTACH] as-is; reparser may handle it
+			}
+			$filename = $context['attachments'][$attach_id]['filename'];
+			$GLOBALS['_attach_fixes_' . $row_type] = ($GLOBALS['_attach_fixes_' . $row_type] ?? 0) + 1;
+			return $make_replacement($attach_id, $filename);
+		},
+		$text
+	);
+
+	// --- Pattern B: [IMG]<local-url>/attachment.php?attachmentid=N[...][/IMG] ---
+	$text = preg_replace_callback(
+		$pattern_img,
+		function ($m) use ($context, $make_replacement, $is_duplicate, $row_id, $row_label, $row_type) {
+			$attach_id = (int) $m[1];
+			if (!isset($context['attachments'][$attach_id]))
+			{
+				$GLOBALS['_lookup_misses'][] = ['row_id' => $row_id, 'attach_id' => $attach_id, 'pattern' => 'IMG-local', 'row_type' => $row_type];
+				return $m[0];
+			}
+			if ($is_duplicate($attach_id))
+			{
+				return $m[0];
+			}
+			$filename = $context['attachments'][$attach_id]['filename'];
+			$GLOBALS['_img_fixes_' . $row_type] = ($GLOBALS['_img_fixes_' . $row_type] ?? 0) + 1;
+			return $make_replacement($attach_id, $filename);
+		},
+		$text
+	);
+
+	// --- Pattern C: phpBB's parsed XML <IMG ...>...</IMG> wrapping a local attachment.php URL ---
+	$text = preg_replace_callback(
+		$pattern_img_xml,
+		function ($m) use ($context, $make_replacement, $is_duplicate, $row_id, $row_label, $row_type) {
+			$attach_id = (int) $m[1];
+			if (!isset($context['attachments'][$attach_id]))
+			{
+				$GLOBALS['_lookup_misses'][] = ['row_id' => $row_id, 'attach_id' => $attach_id, 'pattern' => 'IMG-xml', 'row_type' => $row_type];
+				return $m[0];
+			}
+			if ($is_duplicate($attach_id))
+			{
+				// The <IMG src="http://...attachment.php?N"> is leftover XML
+				// from before; the canonical <ATTACHMENT> block already exists
+				// elsewhere in the post. Remove this stale XML rather than
+				// leaving a phantom broken-link element.
+				return '';
+			}
+			$filename = $context['attachments'][$attach_id]['filename'];
+			$GLOBALS['_img_fixes_' . $row_type] = ($GLOBALS['_img_fixes_' . $row_type] ?? 0) + 1;
+			return $make_replacement($attach_id, $filename);
+		},
+		$text
+	);
+
+	// --- Pattern D (legacy): raw [IMG]<local>/attachment.php?...postid=N...[/IMG] ---
+	// Requires postid_to_attach_id lookup table populated from source DB.
+	$text = preg_replace_callback(
+		$pattern_img_postid,
+		function ($m) use ($context, $make_replacement, $is_duplicate, $row_id, $row_type) {
+			$postid = (int) $m[1];
+			$attach_id = $context['postid_to_attach_id'][$postid] ?? null;
+			if ($attach_id === null)
+			{
+				$GLOBALS['_lookup_misses'][] = ['row_id' => $row_id, 'attach_id' => 0, 'pattern' => "postid=$postid (unresolved)", 'row_type' => $row_type];
+				return $m[0];
+			}
+			if (!isset($context['attachments'][$attach_id]))
+			{
+				$GLOBALS['_lookup_misses'][] = ['row_id' => $row_id, 'attach_id' => $attach_id, 'pattern' => "postid=$postid → IMG-postid", 'row_type' => $row_type];
+				return $m[0];
+			}
+			if ($is_duplicate($attach_id))
+			{
+				return $m[0];
+			}
+			$filename = $context['attachments'][$attach_id]['filename'];
+			$GLOBALS['_img_fixes_' . $row_type] = ($GLOBALS['_img_fixes_' . $row_type] ?? 0) + 1;
+			return $make_replacement($attach_id, $filename);
+		},
+		$text
+	);
+
+	// --- Pattern D (legacy): XML <IMG src="...attachment.php?...postid=N..."> ---
+	$text = preg_replace_callback(
+		$pattern_img_xml_postid,
+		function ($m) use ($context, $make_replacement, $is_duplicate, $row_id, $row_type) {
+			$postid = (int) $m[1];
+			$attach_id = $context['postid_to_attach_id'][$postid] ?? null;
+			if ($attach_id === null)
+			{
+				$GLOBALS['_lookup_misses'][] = ['row_id' => $row_id, 'attach_id' => 0, 'pattern' => "postid=$postid (unresolved)", 'row_type' => $row_type];
+				return $m[0];
+			}
+			if (!isset($context['attachments'][$attach_id]))
+			{
+				$GLOBALS['_lookup_misses'][] = ['row_id' => $row_id, 'attach_id' => $attach_id, 'pattern' => "postid=$postid → IMG-xml-postid", 'row_type' => $row_type];
+				return $m[0];
+			}
+			if ($is_duplicate($attach_id))
+			{
+				return '';
+			}
+			$filename = $context['attachments'][$attach_id]['filename'];
+			$GLOBALS['_img_fixes_' . $row_type] = ($GLOBALS['_img_fixes_' . $row_type] ?? 0) + 1;
+			return $make_replacement($attach_id, $filename);
+		},
+		$text
+	);
+
+	if ($text === $original) return null;
+	return $text;
 }
 
-echo "\n";
+/**
+* Capture context-aware before/after sample for the report.
+*/
+function capture_sample(array &$samples, int $row_id, string $row_type, string $before, string $after, int $max = 5): void
+{
+	if (count($samples) >= $max) return;
+
+	$diff_pos = 0;
+	$min_len = min(strlen($before), strlen($after));
+	for ($i = 0; $i < $min_len; $i++)
+	{
+		if ($before[$i] !== $after[$i])
+		{
+			$diff_pos = $i;
+			break;
+		}
+	}
+	$start = max(0, $diff_pos - 80);
+
+	$samples[] = [
+		'row_id'   => $row_id,
+		'row_type' => $row_type,
+		'before'   => mb_substr($before, $start, 280),
+		'after'    => mb_substr($after,  $start, 280),
+	];
+}
+
+// Initialise global accumulators (used by the rewriter callbacks)
+$GLOBALS['_lookup_misses']     = [];
+$GLOBALS['_skipped_duplicates'] = [];
+$GLOBALS['_attach_fixes_post'] = 0;
+$GLOBALS['_attach_fixes_sig']  = 0;
+$GLOBALS['_attach_fixes_pm']   = 0;
+$GLOBALS['_img_fixes_post']    = 0;
+$GLOBALS['_img_fixes_sig']     = 0;
+$GLOBALS['_img_fixes_pm']      = 0;
+
+$context = [
+	'attachments' => $attachments,
+	'postid_to_attach_id' => $postid_to_attach_id,
+];
+
+$updates = [
+	'post' => [],   // post_id => new_text
+	'sig'  => [],   // user_id => new_text
+	'pm'   => [],   // msg_id  => new_text
+];
+$samples = [];
+
+$query_chunk = 500;
+
+// ----- Scan posts -----
+if (!$opts['skip-posts'])
+{
+	echo "Scanning posts (post_text) for fixable patterns...\n";
+
+	$sql = 'SELECT COUNT(*) AS n FROM ' . POSTS_TABLE . "
+	        WHERE post_text LIKE '%[ATTACH]%'
+	        OR post_text LIKE '%attachment.php?attachmentid=%'
+	        OR post_text LIKE '%attachment.php?%postid=%'";
+	$result = $db->sql_query($sql);
+	$candidate_count = (int) $db->sql_fetchfield('n');
+	$db->sql_freeresult($result);
+
+	echo "  Candidate posts: " . number_format($candidate_count) . "\n";
+
+	$offset = 0;
+	while (true)
+	{
+		$sql = 'SELECT post_id, post_text
+		        FROM ' . POSTS_TABLE . "
+		        WHERE post_text LIKE '%[ATTACH]%'
+		        OR post_text LIKE '%attachment.php?attachmentid=%'
+	        OR post_text LIKE '%attachment.php?%postid=%'
+		        ORDER BY post_id
+		        LIMIT $offset, $query_chunk";
+		$result = $db->sql_query($sql);
+
+		$batch_count = 0;
+		while ($row = $db->sql_fetchrow($result))
+		{
+			$batch_count++;
+			$post_id = (int) $row['post_id'];
+			$new_text = rewrite_text($context, $row['post_text'], $post_id, 'post', 'bbcode');
+			if ($new_text !== null)
+			{
+				$updates['post'][$post_id] = $new_text;
+				capture_sample($samples, $post_id, 'post', $row['post_text'], $new_text);
+			}
+		}
+		$db->sql_freeresult($result);
+
+		if ($batch_count < $query_chunk) break;
+		$offset += $query_chunk;
+		if ($offset % 5000 === 0) echo "  Scanned " . number_format($offset) . " posts...\n";
+	}
+
+	echo "  Posts to update: " . number_format(count($updates['post'])) . "\n";
+	echo "\n";
+}
+
+// ----- Scan signatures -----
+if (!$opts['skip-signatures'])
+{
+	echo "Scanning user signatures (user_sig) for fixable patterns...\n";
+
+	$sql = 'SELECT COUNT(*) AS n FROM ' . USERS_TABLE . "
+	        WHERE user_sig LIKE '%[ATTACH]%'
+	        OR user_sig LIKE '%attachment.php?attachmentid=%'
+	        OR user_sig LIKE '%attachment.php?%postid=%'";
+	$result = $db->sql_query($sql);
+	$candidate_count = (int) $db->sql_fetchfield('n');
+	$db->sql_freeresult($result);
+
+	echo "  Candidate signatures: " . number_format($candidate_count) . "\n";
+
+	$sql = 'SELECT user_id, user_sig
+	        FROM ' . USERS_TABLE . "
+	        WHERE user_sig LIKE '%[ATTACH]%'
+	        OR user_sig LIKE '%attachment.php?attachmentid=%'
+	        OR user_sig LIKE '%attachment.php?%postid=%'";
+	$result = $db->sql_query($sql);
+
+	while ($row = $db->sql_fetchrow($result))
+	{
+		$user_id = (int) $row['user_id'];
+		$new_text = rewrite_text($context, $row['user_sig'], $user_id, 'sig', 'url');
+		if ($new_text !== null)
+		{
+			$updates['sig'][$user_id] = $new_text;
+			capture_sample($samples, $user_id, 'sig', $row['user_sig'], $new_text);
+		}
+	}
+	$db->sql_freeresult($result);
+
+	echo "  Signatures to update: " . number_format(count($updates['sig'])) . "\n";
+	echo "\n";
+}
+
+// ----- Scan private messages -----
+if (!$opts['skip-pms'])
+{
+	echo "Scanning private messages (privmsgs.message_text) for fixable patterns...\n";
+
+	$sql = 'SELECT COUNT(*) AS n FROM ' . PRIVMSGS_TABLE . "
+	        WHERE message_text LIKE '%[ATTACH]%'
+	        OR message_text LIKE '%attachment.php?attachmentid=%'
+	        OR message_text LIKE '%attachment.php?%postid=%'";
+	$result = $db->sql_query($sql);
+	$candidate_count = (int) $db->sql_fetchfield('n');
+	$db->sql_freeresult($result);
+
+	echo "  Candidate PMs: " . number_format($candidate_count) . "\n";
+
+	$sql = 'SELECT msg_id, message_text
+	        FROM ' . PRIVMSGS_TABLE . "
+	        WHERE message_text LIKE '%[ATTACH]%'
+	        OR message_text LIKE '%attachment.php?attachmentid=%'
+	        OR message_text LIKE '%attachment.php?%postid=%'";
+	$result = $db->sql_query($sql);
+
+	while ($row = $db->sql_fetchrow($result))
+	{
+		$msg_id = (int) $row['msg_id'];
+		$new_text = rewrite_text($context, $row['message_text'], $msg_id, 'pm', 'url');
+		if ($new_text !== null)
+		{
+			$updates['pm'][$msg_id] = $new_text;
+			capture_sample($samples, $msg_id, 'pm', $row['message_text'], $new_text);
+		}
+	}
+	$db->sql_freeresult($result);
+
+	echo "  PMs to update: " . number_format(count($updates['pm'])) . "\n";
+	echo "\n";
+}
+
+// Aggregate stats for report
+$total_attach_fixes = $GLOBALS['_attach_fixes_post'] + $GLOBALS['_attach_fixes_sig'] + $GLOBALS['_attach_fixes_pm'];
+$total_img_fixes    = $GLOBALS['_img_fixes_post']    + $GLOBALS['_img_fixes_sig']    + $GLOBALS['_img_fixes_pm'];
+$lookup_misses      = $GLOBALS['_lookup_misses'];
+
+$total_to_update = count($updates['post']) + count($updates['sig']) + count($updates['pm']);
+
 echo "Scan complete:\n";
-echo "  Posts scanned:                " . number_format($total_posts_scanned) . "\n";
-echo "  Posts to update:              " . number_format(count($posts_to_update)) . "\n";
+echo "  Rows to update (total):       " . number_format($total_to_update) . "\n";
+echo "    posts:                      " . number_format(count($updates['post'])) . "\n";
+echo "    signatures:                 " . number_format(count($updates['sig']))  . "\n";
+echo "    private messages:           " . number_format(count($updates['pm']))   . "\n";
 echo "  [ATTACH]N[/ATTACH] fixes:     " . number_format($total_attach_fixes) . "\n";
-echo "  [IMG] URL fixes:              " . number_format($total_img_fixes) . "\n";
+echo "    posts: {$GLOBALS['_attach_fixes_post']}, sigs: {$GLOBALS['_attach_fixes_sig']}, pms: {$GLOBALS['_attach_fixes_pm']}\n";
+echo "  [IMG]/URL fixes:              " . number_format($total_img_fixes) . "\n";
+echo "    posts: {$GLOBALS['_img_fixes_post']}, sigs: {$GLOBALS['_img_fixes_sig']}, pms: {$GLOBALS['_img_fixes_pm']}\n";
 echo "  Attachment lookup misses:     " . count($lookup_misses) . "\n";
+echo "  Skipped duplicates:           " . count($GLOBALS['_skipped_duplicates']) . "\n";
+echo "    (already had <ATTACHMENT> block for same filename — left alone to avoid double-render)\n";
 echo "\n";
 
-if (count($sample_changes))
+if (count($samples))
 {
 	echo "Sample rewrites (first 5):\n";
 	echo str_repeat('-', 78) . "\n";
-	foreach ($sample_changes as $i => $c)
+	foreach ($samples as $c)
 	{
-		printf("\n  Post %d:\n", $c['post_id']);
+		printf("\n  %s %d:\n", strtoupper($c['row_type']), $c['row_id']);
 		echo "    BEFORE: " . preg_replace('/\s+/', ' ', $c['before']) . "...\n";
 		echo "    AFTER:  " . preg_replace('/\s+/', ' ', $c['after']) . "...\n";
 	}
@@ -459,11 +822,11 @@ if (count($sample_changes))
 
 if (count($lookup_misses))
 {
-	echo "Lookup misses (attach_id referenced in post but not in phpbb_attachments):\n";
-	$samples = array_slice($lookup_misses, 0, 10);
-	foreach ($samples as $m)
+	echo "Lookup misses (attach_id referenced but not in phpbb_attachments):\n";
+	$shown = array_slice($lookup_misses, 0, 10);
+	foreach ($shown as $m)
 	{
-		printf("  Post %d, attach_id %d (%s)\n", $m['post_id'], $m['attach_id'], $m['pattern']);
+		printf("  %s %d, attach_id %d (%s)\n", $m['row_type'], $m['row_id'], $m['attach_id'], $m['pattern']);
 	}
 	if (count($lookup_misses) > 10) echo "  ... and " . (count($lookup_misses) - 10) . " more\n";
 	echo "\n";
@@ -478,11 +841,11 @@ if ($opts['dry-run'])
 	echo str_repeat('=', 78) . "\n";
 	echo "DRY-RUN MODE — no changes were written.\n";
 	echo "To apply: re-run without --dry-run\n";
-	write_report($opts, $total_posts_scanned, $posts_to_update, $total_attach_fixes, $total_img_fixes, $lookup_misses, $sample_changes, false);
+	write_report($opts, $updates, $total_attach_fixes, $total_img_fixes, $lookup_misses, $samples, false, []);
 	exit(0);
 }
 
-if (count($posts_to_update) === 0)
+if ($total_to_update === 0)
 {
 	echo "Nothing to do. Exiting.\n";
 	exit(0);
@@ -511,34 +874,59 @@ if (!$opts['yes'])
 // Apply phase
 // -----------------------------------------------------------------------
 
-echo "Applying " . count($posts_to_update) . " post updates...\n";
+$applied = ['post' => 0, 'sig' => 0, 'pm' => 0, 'post_flag' => 0];
 
-$applied = 0;
-foreach ($posts_to_update as $post_id => $new_text)
+// Apply post updates
+if (!empty($updates['post']))
 {
-	$db->sql_query('UPDATE ' . POSTS_TABLE . '
-	                SET post_text = \'' . $db->sql_escape($new_text) . '\'
-	                WHERE post_id = ' . (int) $post_id);
-	$applied++;
-
-	if ($applied % 500 === 0)
+	echo "Applying " . count($updates['post']) . " post updates...\n";
+	foreach ($updates['post'] as $post_id => $new_text)
 	{
-		echo "  Updated " . number_format($applied) . " posts...\n";
+		$db->sql_query('UPDATE ' . POSTS_TABLE . '
+		                SET post_text = \'' . $db->sql_escape($new_text) . '\'
+		                WHERE post_id = ' . (int) $post_id);
+		$applied['post']++;
+		if ($applied['post'] % 500 === 0) echo "  Updated " . number_format($applied['post']) . " posts...\n";
 	}
+	echo "  Updated " . number_format($applied['post']) . " posts.\n";
+
+	// Mark posts that now have inline attachments
+	$ids = implode(',', array_map('intval', array_keys($updates['post'])));
+	$db->sql_query("UPDATE " . POSTS_TABLE . "
+	                SET post_attachment = 1
+	                WHERE post_id IN ($ids) AND post_attachment = 0");
+	$applied['post_flag'] = (int) $db->sql_affectedrows();
+	echo "  Marked " . $applied['post_flag'] . " posts as having attachments.\n";
+	echo "\n";
 }
 
-echo "  Updated " . number_format($applied) . " posts.\n";
+// Apply signature updates
+if (!empty($updates['sig']))
+{
+	echo "Applying " . count($updates['sig']) . " signature updates...\n";
+	foreach ($updates['sig'] as $user_id => $new_text)
+	{
+		$db->sql_query('UPDATE ' . USERS_TABLE . '
+		                SET user_sig = \'' . $db->sql_escape($new_text) . '\'
+		                WHERE user_id = ' . (int) $user_id);
+		$applied['sig']++;
+	}
+	echo "  Updated " . number_format($applied['sig']) . " signatures.\n\n";
+}
 
-// Update post_attachment flag - mark posts that now have [attachment=...] BBCode
-echo "\nUpdating post_attachment flags...\n";
-$sql = "UPDATE " . POSTS_TABLE . "
-        SET post_attachment = 1
-        WHERE post_id IN (" . implode(',', array_map('intval', array_keys($posts_to_update))) . ")
-        AND post_attachment = 0";
-$db->sql_query($sql);
-echo "  Marked " . (int) $db->sql_affectedrows() . " posts as having attachments.\n";
-
-echo "\n";
+// Apply PM updates
+if (!empty($updates['pm']))
+{
+	echo "Applying " . count($updates['pm']) . " PM updates...\n";
+	foreach ($updates['pm'] as $msg_id => $new_text)
+	{
+		$db->sql_query('UPDATE ' . PRIVMSGS_TABLE . '
+		                SET message_text = \'' . $db->sql_escape($new_text) . '\'
+		                WHERE msg_id = ' . (int) $msg_id);
+		$applied['pm']++;
+	}
+	echo "  Updated " . number_format($applied['pm']) . " PMs.\n\n";
+}
 
 // -----------------------------------------------------------------------
 // Optional: invoke phpBB's textformatter reparser
@@ -548,7 +936,8 @@ if ($opts['reparse'])
 {
 	echo str_repeat('=', 78) . "\n";
 	echo "Running phpBB's textformatter reparser...\n";
-	echo "This rebuilds the stored XML for ALL posts and may take 15-30 minutes.\n";
+	echo "Rebuilds the stored XML for posts, signatures, AND private messages.\n";
+	echo "May take 15-30 minutes on a 250k-post board.\n";
 	echo str_repeat('-', 78) . "\n";
 	echo "Started at " . date('H:i:s') . "...\n";
 
@@ -557,12 +946,13 @@ if ($opts['reparse'])
 	{
 		fwrite(STDERR, "Cannot find phpBB CLI at: $cli\n");
 		fwrite(STDERR, "Skipping reparser. You can run it manually:\n");
-		fwrite(STDERR, "  cd $phpbb_root_path && php bin/phpbbcli.php reparser:reparse post_text\n");
+		fwrite(STDERR, "  cd $phpbb_root_path && php bin/phpbbcli.php reparser:reparse\n");
 	}
 	else
 	{
 		@set_time_limit(0);
-		$cmd = 'php ' . escapeshellarg($cli) . ' reparser:reparse post_text 2>&1';
+		// No argument = reparse all rich-text fields (post_text, user_sig, pm_text, etc.)
+		$cmd = 'php ' . escapeshellarg($cli) . ' reparser:reparse 2>&1';
 		passthru($cmd, $reparse_exit_code);
 		echo "Completed at " . date('H:i:s') . " (exit code $reparse_exit_code).\n";
 	}
@@ -571,8 +961,8 @@ if ($opts['reparse'])
 else
 {
 	echo "Reparser NOT invoked (use --reparse to run it).\n";
-	echo "To rebuild post XML manually:\n";
-	echo "  cd $phpbb_root_path && php bin/phpbbcli.php reparser:reparse post_text\n";
+	echo "To rebuild stored XML manually:\n";
+	echo "  cd $phpbb_root_path && php bin/phpbbcli.php reparser:reparse\n";
 	echo "\n";
 }
 
@@ -585,9 +975,12 @@ echo "Attachment fix complete.\n";
 echo str_repeat('=', 78) . "\n\n";
 
 echo "Applied:\n";
-echo "  Posts updated:                " . number_format($applied) . "\n";
+echo "  Posts updated:                " . number_format($applied['post']) . "\n";
+echo "  Signatures updated:           " . number_format($applied['sig']) . "\n";
+echo "  PMs updated:                  " . number_format($applied['pm']) . "\n";
+echo "  post_attachment flag flips:   " . number_format($applied['post_flag']) . "\n";
 echo "  [ATTACH]N[/ATTACH] fixes:     " . number_format($total_attach_fixes) . "\n";
-echo "  [IMG] URL fixes:              " . number_format($total_img_fixes) . "\n";
+echo "  [IMG]/URL fixes:              " . number_format($total_img_fixes) . "\n";
 echo "  Lookup misses (skipped):      " . count($lookup_misses) . "\n";
 if ($opts['reparse'])
 {
@@ -595,7 +988,7 @@ if ($opts['reparse'])
 }
 echo "\n";
 
-write_report($opts, $total_posts_scanned, $posts_to_update, $total_attach_fixes, $total_img_fixes, $lookup_misses, $sample_changes, true);
+write_report($opts, $updates, $total_attach_fixes, $total_img_fixes, $lookup_misses, $samples, true, $applied);
 echo "Report written to: {$opts['report-file']}\n";
 
 exit(0);
@@ -604,7 +997,7 @@ exit(0);
 // HELPERS
 // =======================================================================
 
-function write_report(array $opts, int $scanned, array $updates, int $attach_fixes, int $img_fixes, array $misses, array $samples, bool $applied): void
+function write_report(array $opts, array $updates, int $attach_fixes, int $img_fixes, array $misses, array $samples, bool $applied, array $applied_counts): void
 {
 	$lines = [];
 	$lines[] = str_repeat('=', 78);
@@ -615,12 +1008,24 @@ function write_report(array $opts, int $scanned, array $updates, int $attach_fix
 	$lines[] = '';
 	$lines[] = 'SCAN RESULTS';
 	$lines[] = str_repeat('-', 78);
-	$lines[] = "  Posts scanned:                " . number_format($scanned);
-	$lines[] = "  Posts to update:              " . number_format(count($updates));
+	$lines[] = "  Posts to update:              " . number_format(count($updates['post']));
+	$lines[] = "  Signatures to update:         " . number_format(count($updates['sig']));
+	$lines[] = "  PMs to update:                " . number_format(count($updates['pm']));
 	$lines[] = "  [ATTACH]N[/ATTACH] fixes:     " . number_format($attach_fixes);
-	$lines[] = "  [IMG] URL fixes:              " . number_format($img_fixes);
+	$lines[] = "  [IMG]/URL fixes:              " . number_format($img_fixes);
 	$lines[] = "  Lookup misses:                " . count($misses);
 	$lines[] = '';
+
+	if ($applied)
+	{
+		$lines[] = 'APPLIED';
+		$lines[] = str_repeat('-', 78);
+		$lines[] = "  Posts updated:               " . number_format($applied_counts['post'] ?? 0);
+		$lines[] = "  Signatures updated:          " . number_format($applied_counts['sig']  ?? 0);
+		$lines[] = "  PMs updated:                 " . number_format($applied_counts['pm']   ?? 0);
+		$lines[] = "  post_attachment flag flips:  " . number_format($applied_counts['post_flag'] ?? 0);
+		$lines[] = '';
+	}
 
 	if (!empty($samples))
 	{
@@ -628,7 +1033,7 @@ function write_report(array $opts, int $scanned, array $updates, int $attach_fix
 		$lines[] = str_repeat('-', 78);
 		foreach ($samples as $c)
 		{
-			$lines[] = "Post {$c['post_id']}:";
+			$lines[] = strtoupper($c['row_type']) . " {$c['row_id']}:";
 			$lines[] = "  BEFORE: " . preg_replace('/\s+/', ' ', $c['before']);
 			$lines[] = "  AFTER:  " . preg_replace('/\s+/', ' ', $c['after']);
 			$lines[] = '';
@@ -639,10 +1044,10 @@ function write_report(array $opts, int $scanned, array $updates, int $attach_fix
 	{
 		$lines[] = 'LOOKUP MISSES';
 		$lines[] = str_repeat('-', 78);
-		$lines[] = '(attach_id was referenced in post_text but does not exist in phpbb_attachments)';
+		$lines[] = '(attach_id was referenced but does not exist in phpbb_attachments)';
 		foreach (array_slice($misses, 0, 50) as $m)
 		{
-			$lines[] = sprintf("  Post %d: attach_id %d (%s)", $m['post_id'], $m['attach_id'], $m['pattern']);
+			$lines[] = sprintf("  %s %d: attach_id %d (%s)", $m['row_type'], $m['row_id'], $m['attach_id'], $m['pattern']);
 		}
 		if (count($misses) > 50) $lines[] = "  ... and " . (count($misses) - 50) . " more";
 		$lines[] = '';
@@ -658,13 +1063,13 @@ function write_report(array $opts, int $scanned, array $updates, int $attach_fix
 	{
 		if (!$opts['reparse'])
 		{
-			$lines[] = '  Run phpBB\'s textformatter reparser to rebuild post XML:';
-			$lines[] = "    cd {$opts['phpbb-root']} && php bin/phpbbcli.php reparser:reparse post_text";
-			$lines[] = '  This may take 15-30 minutes on large boards.';
+			$lines[] = '  Run phpBB\'s textformatter reparser to rebuild stored XML:';
+			$lines[] = "    cd {$opts['phpbb-root']} && php bin/phpbbcli.php reparser:reparse";
+			$lines[] = '  This rebuilds posts, signatures, AND PMs. May take 15-30 minutes on large boards.';
 		}
 		else
 		{
-			$lines[] = '  Reparser was run. Test post rendering in the browser.';
+			$lines[] = '  Reparser was run. Test post/signature rendering in the browser.';
 		}
 	}
 	$lines[] = '';

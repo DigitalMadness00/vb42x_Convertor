@@ -5,6 +5,29 @@ are the fixes required to make it work against phpBB 3.3.x on PHP 7+/8.x.
 
 ## New in this release
 
+- **Attachment-URL fixer script** (`scripts/fix_attachment_urls.php`) — fixes
+  vBulletin attachment markup that survived conversion as broken text:
+  - `[ATTACH]N[/ATTACH]` (old vB BBCode that the convertor's
+    `vb_reformat_inline_attach()` didn't handle — only the newer `[ATTACH=CONFIG]`
+    form was converted)
+  - `[IMG]http://<local>/attachment.php?attachmentid=N[/IMG]` (URLs users
+    manually pasted that point at vB's defunct attachment.php endpoint)
+
+  Both are rewritten to phpBB's native `[attachment=I]filename[/attachment]`
+  BBCode, with the per-post sequential index and filename looked up from
+  `phpbb_attachments`. External URLs (other forums) are left alone. Optionally
+  invokes phpBB's textformatter reparser (`--reparse`) to rebuild stored XML.
+
+- **Convertor improvements to `vb_reformat_inline_attach()`** — now handles
+  three vB attachment-BBCode formats during conversion:
+  - `[ATTACH=CONFIG]N[/ATTACH]` (newer vB) — already worked
+  - `[ATTACH]N[/ATTACH]` (older vB, was previously missed)
+  - `[IMG]<bburl>/attachment.php?attachmentid=N[/IMG]` (raw URL form, was
+    previously missed)
+
+  This benefits new conversions; existing converted boards should run the
+  standalone fixer above.
+
 - **Post-conversion wrapper script** (`scripts/post_convert.php`) — runs
   all standard post-conversion cleanups in one command:
   1. Verifies the conversion completed (bails if counts look wrong)
