@@ -185,14 +185,58 @@ This lets you eyeball whether the numbers match what your old vB ACP says
 
 ## Post-conversion checklist
 
-phpBB doesn't do these automatically. Do them in the ACP after conversion
-finishes:
+### Quick path: one-command wrapper
 
-1. **General → Statistics → Resync statistics** — recomputes post counts,
-   last-post pointers, etc.
-2. **Maintenance → Search index → Create index** — converted posts won't
-   appear in search results until the index is built. The default Native
-   Fulltext driver works fine on most boards.
+Run `scripts/post_convert.php` to do everything in one step:
+
+```bash
+# Preview what will change without applying
+php scripts/post_convert.php --dry-run
+
+# Run interactively (analyzes, prompts to confirm, then applies)
+php scripts/post_convert.php --src-name=<your_vb_db>
+
+# For automation (skips the prompt)
+php scripts/post_convert.php --yes --src-name=<your_vb_db>
+```
+
+The wrapper runs four phases:
+1. **Verify conversion completed** — bails if posts/users counts look wrong
+2. **Reassign orphan posts** — fixes `phpbb_posts.poster_id` references to deleted users
+3. **Permission mapping** — invokes `scripts/map_permissions.php` (see below)
+4. **Forum/topic statistics resync** — recomputes counts and last-post pointers
+
+By default it does an analysis pass, prints a summary, prompts `Apply all
+these changes? [yes/N]`, and only writes if you type `yes`. Use `--yes`
+to skip the prompt for automation.
+
+For more control, run the individual scripts described below.
+
+### Manual ACP steps that the wrapper does NOT do
+
+These have to happen in the phpBB ACP because they're either too slow
+for a script to handle gracefully or genuinely need human judgment:
+
+1. **Maintenance → Search index → Create index** — converted posts
+   won't appear in search results until the index is built. The default
+   Native Fulltext driver works fine on most boards. Building takes
+   hours on large boards, so it's not in the wrapper.
+2. **Review permission-mapping WARNINGS** — see `/tmp/vb4_perm_report.txt`
+   for forums where moderators got locked out of forums whose names
+   suggest mod scope. Decide whether to grant read access manually.
+3. **Delete or rename phpBB's `install/` directory** for security:
+   ```bash
+   rm -rf phpBB/install
+   # or keep it for re-running the convertor:
+   mv phpBB/install phpBB/old.install
+   ```
+
+### Detailed: the individual scripts
+
+If you want to run only specific phases (e.g. permission mapping
+without stats resync, or with a custom `--aggressive` setting), call
+the individual scripts directly:
+
 3. **Forum permissions** — vBulletin's permission model doesn't map cleanly
    onto phpBB's. **Use the included permission-mapping script** to handle
    group consolidation and per-forum ACL setup automatically:
@@ -525,3 +569,4 @@ When reporting bugs, please include:
 
 For schema-related issues, the relevant SQL error message (with the column
 name) is usually enough to pinpoint the fix.
+

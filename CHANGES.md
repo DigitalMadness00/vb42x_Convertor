@@ -5,6 +5,22 @@ are the fixes required to make it work against phpBB 3.3.x on PHP 7+/8.x.
 
 ## New in this release
 
+- **Post-conversion wrapper script** (`scripts/post_convert.php`) — runs
+  all standard post-conversion cleanups in one command:
+  1. Verifies the conversion completed (bails if counts look wrong)
+  2. Reassigns orphan posts to ANONYMOUS (fixes `phpbb_posts.poster_id`
+     references to deleted users — resolves issue #3)
+  3. Invokes `scripts/map_permissions.php` for permission mapping
+  4. Runs phpBB's `sync('forum', ...)` and `sync('topic', ...)` to
+     recompute post counts and last-post pointers
+
+  Default UX: analyzes everything in dry-run mode, prints a summary,
+  prompts for confirmation, then applies. Use `--yes`/`-y` to skip the
+  prompt (for automation). Use `--skip-orphans` / `--skip-permissions`
+  / `--skip-stats` to run individual phases.
+
+  See README for usage details.
+
 - **Permission-mapping script** (`scripts/map_permissions.php`) — handles
   the post-conversion ACP-permissions setup that previously required hours
   of manual clicking. The script:
