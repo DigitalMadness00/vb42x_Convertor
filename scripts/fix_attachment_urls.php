@@ -467,19 +467,32 @@ function rewrite_text(array &$context, string $text, int $row_id, string $row_ty
 		return false;
 	};
 
-	$make_replacement = function ($attach_id, $filename) use (&$post_index, &$index_for_attach, $mode) {
-		if (!isset($index_for_attach[$attach_id]))
+	$make_replacement = function ($attach_id, $filename) use (&$post_index, &$index_for_attach, $mode, $context, $row_id, $row_type) {
+		// Decide whether to produce [attachment=I]filename[/attachment] BBCode
+		// (works only when phpbb_attachments has post_msg_id == $row_id for
+		// this attach_id) or the URL form ./download/file.php?id=N (works
+		// universally since download/file.php enforces permission checks at
+		// serve time).
+		//
+		// The BBCode form gives proper phpBB inline-attachment rendering
+		// (image plus attachment-list entry). The URL form just renders
+		// the image. We prefer BBCode when possible.
+		$attach_owner = $context['attachments'][$attach_id]['post_msg_id'] ?? 0;
+		$use_bbcode = ($mode === 'bbcode' && $row_type === 'post' && $attach_owner === $row_id);
+
+		if ($use_bbcode)
 		{
-			$index_for_attach[$attach_id] = $post_index++;
-		}
-		$index = $index_for_attach[$attach_id];
-		if ($mode === 'bbcode')
-		{
+			if (!isset($index_for_attach[$attach_id]))
+			{
+				$index_for_attach[$attach_id] = $post_index++;
+			}
+			$index = $index_for_attach[$attach_id];
 			return "[attachment=$index]$filename" . "[/attachment]";
 		}
-		// 'url' mode: produce a phpBB-flavored <IMG> XML pointing at download/file.php.
-		// We construct just <IMG src="...">...</IMG> with the URL, expecting that
-		// phpBB's reparser will rebuild proper textformatter XML afterward.
+
+		// URL mode: produce a phpBB-flavored <IMG> XML pointing at
+		// download/file.php. The reparser will normalize this XML to canonical
+		// form afterward.
 		return '<IMG src="./download/file.php?id=' . (int) $attach_id . '"><s>[img]</s><URL url="./download/file.php?id=' . (int) $attach_id . '"><LINK_TEXT text="./download/file.php?id=' . (int) $attach_id . '">./download/file.php?id=' . (int) $attach_id . '</LINK_TEXT></URL><e>[/img]</e></IMG>';
 	};
 
@@ -890,13 +903,30 @@ if (!empty($updates['post']))
 	}
 	echo "  Updated " . number_format($applied['post']) . " posts.\n";
 
-	// Mark posts that now have inline attachments
-	$ids = implode(',', array_map('intval', array_keys($updates['post'])));
-	$db->sql_query("UPDATE " . POSTS_TABLE . "
-	                SET post_attachment = 1
-	                WHERE post_id IN ($ids) AND post_attachment = 0");
-	$applied['post_flag'] = (int) $db->sql_affectedrows();
-	echo "  Marked " . $applied['post_flag'] . " posts as having attachments.\n";
+	// Mark posts that now have inline attachments. Only posts whose updated
+	// text contains [attachment=N] BBCode count; URL-form rewrites point at
+	// download/file.php and don't trigger phpBB's attachment-list rendering.
+	$posts_with_bbcode = [];
+	foreach ($updates['post'] as $post_id => $new_text)
+	{
+		if (strpos($new_text, '[attachment=') !== false)
+		{
+			$posts_with_bbcode[] = (int) $post_id;
+		}
+	}
+	if (!empty($posts_with_bbcode))
+	{
+		$ids = implode(',', $posts_with_bbcode);
+		$db->sql_query("UPDATE " . POSTS_TABLE . "
+		                SET post_attachment = 1
+		                WHERE post_id IN ($ids) AND post_attachment = 0");
+		$applied['post_flag'] = (int) $db->sql_affectedrows();
+	}
+	else
+	{
+		$applied['post_flag'] = 0;
+	}
+	echo "  Marked " . $applied['post_flag'] . " posts as having attachments (" . count($posts_with_bbcode) . " had BBCode form).\n";
 	echo "\n";
 }
 

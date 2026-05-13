@@ -6,17 +6,27 @@ are the fixes required to make it work against phpBB 3.3.x on PHP 7+/8.x.
 ## New in this release
 
 - **Attachment-URL fixer script** (`scripts/fix_attachment_urls.php`) — fixes
-  vBulletin attachment markup that survived conversion as broken text:
-  - `[ATTACH]N[/ATTACH]` (old vB BBCode that the convertor's
-    `vb_reformat_inline_attach()` didn't handle — only the newer `[ATTACH=CONFIG]`
-    form was converted)
-  - `[IMG]http://<local>/attachment.php?attachmentid=N[/IMG]` (URLs users
-    manually pasted that point at vB's defunct attachment.php endpoint)
+  vBulletin attachment markup that survived conversion as broken text/dead
+  links. Scans three text columns: `phpbb_posts.post_text`,
+  `phpbb_users.user_sig`, and `phpbb_privmsgs.message_text`. Handles four
+  patterns:
+  - `[ATTACH]N[/ATTACH]` (old vB BBCode the convertor missed; only the
+    newer `[ATTACH=CONFIG]` form was being converted)
+  - `[IMG]http://<local>/attachment.php?attachmentid=N[/IMG]` (raw URL form)
+  - phpBB's parsed XML form of the above
+  - **Legacy `attachment.php?postid=N` URLs** (vB2/vB3 era — `N` is the
+    *post* id, not the attachment id; resolved via source-DB lookup)
 
-  Both are rewritten to phpBB's native `[attachment=I]filename[/attachment]`
-  BBCode, with the per-post sequential index and filename looked up from
-  `phpbb_attachments`. External URLs (other forums) are left alone. Optionally
-  invokes phpBB's textformatter reparser (`--reparse`) to rebuild stored XML.
+  Rewrites are smart about target: posts that *own* the referenced attachment
+  get phpBB's native `[attachment=I]filename[/attachment]` BBCode (full inline
+  rendering with attachment-list entry). Cross-post references and signatures/
+  PMs get a `<IMG src="./download/file.php?id=N">` URL form (image displays,
+  no attachment-list entry). External URLs (other forums) are left alone.
+
+  Optional `--reparse` flag invokes phpBB's textformatter reparser so the
+  stored XML gets rebuilt cleanly. Requires source-DB credentials
+  (`--src-host`, `--src-user`, `--src-pass`, `--src-name`) when using
+  legacy `postid=N` URL handling. Use `--skip-postid` to disable that.
 
 - **Convertor improvements to `vb_reformat_inline_attach()`** — now handles
   three vB attachment-BBCode formats during conversion:
